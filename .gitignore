@@ -7,6 +7,19 @@ coverage/
 .env.*
 !.env.example
 
+# ---------------------------------------------------------------------------
+# Instance-specific deployment state — NEVER commit.
+#
+# The GitHub repo is PUBLIC, so anything naming a real host, SSH user, key path
+# or token stays local. Reusable templates are committed under *.example.* and
+# the tunnel plist keeps __PLACEHOLDER__ markers instead of real values.
+# ---------------------------------------------------------------------------
+deploy/VPS-DEPLOYED.md
+# Any locally filled-in overlay for a specific deployment
+deploy/*.local.yml
+# Host keys captured while deploying (if pointed inside the repo)
+.ssh-known-hosts
+
 # Local npm cache used when the global cache is unusable
 .npm-cache/
 

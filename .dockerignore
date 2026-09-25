@@ -1,0 +1,33 @@
+# Keep the Docker build context small and the image reproducible.
+#
+# Without this file the context includes node_modules (62 MB) and the local npm
+# cache (65 MB), all of which is uploaded to the daemon and then thrown away,
+# because the Dockerfile installs dependencies from the lockfile itself.
+
+node_modules
+.npm-cache
+dist
+coverage
+
+# Never ship secrets or VCS history into an image layer.
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+
+# Tests, docs and deploy templates are not needed to build or run the server.
+# The Dockerfile itself is deliberately NOT excluded: some builders read it from
+# the context, and excluding it is a classic self-inflicted build failure.
+test
+scripts
+deploy
+*.md
+docker-compose.yml
+
+# Editor/OS noise
+.DS_Store
+.idea
+.vscode
+*.log
+*.tsbuildinfo

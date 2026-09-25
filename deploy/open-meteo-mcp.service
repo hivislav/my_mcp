@@ -45,10 +45,13 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# NOTE: do NOT add MemoryDenyWriteExecute=true here. V8 compiles JavaScript to
+# machine code at runtime and needs writable-executable memory, so that option
+# makes Node.js abort on startup. Verified against Node.js/V8 hardening reports.
+# The rest of the sandbox below stays effective without it.
 # The process only needs to make outbound HTTPS calls and serve one port.
 CapabilityBoundingSet=
 AmbientCapabilities=

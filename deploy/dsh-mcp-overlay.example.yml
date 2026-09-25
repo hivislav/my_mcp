@@ -61,7 +61,9 @@
 #         transport: streamable-http
 #         url: https://mcp.example.com/mcp
 #         headers:
-#           Authorization: !!js `Bearer ${process.env.OPEN_METEO_MCP_TOKEN ?? ''}`
+#           # YAML-quoted JS expression: a backtick starts a reserved YAML
+#           # indicator, so a template literal fails to parse (YAMLException).
+#           Authorization: !!js "'Bearer ' + (process.env.OPEN_METEO_MCP_TOKEN ?? '')"
 #         toolCallTimeoutMs: 60000
 #         failOnStartupError: true
 #         reconnect:

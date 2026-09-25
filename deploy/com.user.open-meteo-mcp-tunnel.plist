@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.user.open-meteo-mcp-tunnel</string>
+
+	<!--
+		Keeps `127.0.0.1:3000` on this Mac forwarded to the MCP server running on
+		the VPS, over an SSH connection. The MCP server itself is published only on
+		the VPS loopback interface, so this tunnel is the only way in — there is no
+		public endpoint and no TLS certificate to manage.
+
+		Install:
+			cp deploy/com.user.open-meteo-mcp-tunnel.plist ~/Library/LaunchAgents/
+			launchctl load -w ~/Library/LaunchAgents/com.user.open-meteo-mcp-tunnel.plist
+
+		Check:   launchctl list | grep open-meteo
+		Logs:    tail -f /tmp/open-meteo-mcp-tunnel.err
+		Remove:  launchctl unload -w ~/Library/LaunchAgents/com.user.open-meteo-mcp-tunnel.plist
+		         rm ~/Library/LaunchAgents/com.user.open-meteo-mcp-tunnel.plist
+	-->
+
+	<!--
+		Это ШАБЛОН. Перед установкой замените три заглушки на свои значения —
+		готовый файл с реальными данными держите вне репозитория (он публичный):
+
+			__SSH_KEY_PATH__  абсолютный путь к приватному SSH-ключу
+			__VPS_USER__      пользователь на VPS
+			__VPS_HOST__      адрес или домен VPS
+
+		Подстановка одной командой:
+			sed -e "s|__SSH_KEY_PATH__|$HOME/.ssh/id_ed25519|" \
+			    -e "s|__VPS_USER__|myuser|" \
+			    -e "s|__VPS_HOST__|203.0.113.10|" \
+			    deploy/com.user.open-meteo-mcp-tunnel.plist \
+			    > ~/Library/LaunchAgents/com.user.open-meteo-mcp-tunnel.plist
+	-->
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/ssh</string>
+		<string>-N</string>
+		<string>-i</string>
+		<string>__SSH_KEY_PATH__</string>
+		<!-- BatchMode: never prompt. A prompt would hang the agent's tool call. -->
+		<string>-o</string>
+		<string>BatchMode=yes</string>
+		<!-- Fail loudly instead of running without the forward. -->
+		<string>-o</string>
+		<string>ExitOnForwardFailure=yes</string>
+		<string>-o</string>
+		<string>StrictHostKeyChecking=accept-new</string>
+		<!-- Detect a dead link (NAT timeouts, VPS reboot) instead of hanging. -->
+		<string>-o</string>
+		<string>ServerAliveInterval=30</string>
+		<string>-o</string>
+		<string>ServerAliveCountMax=3</string>
+		<string>-o</string>
+		<string>TCPKeepAlive=yes</string>
+		<string>-L</string>
+		<string>3000:127.0.0.1:3000</string>
+		<string>__VPS_USER__@__VPS_HOST__</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- Restart the tunnel whenever it dies, so the agent never loses the server. -->
+	<key>KeepAlive</key>
+	<true/>
+	<!-- Do not hammer the VPS if it is rebooting. -->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>/tmp/open-meteo-mcp-tunnel.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/open-meteo-mcp-tunnel.err</string>
+</dict>
+</plist>

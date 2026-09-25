@@ -1,0 +1,45 @@
+# Готовый оверлей DSH для подключения к MCP-серверу, развёрнутому на VPS.
+#
+# Схема: агент на этом Mac -> SSH-туннель (launchd) -> 127.0.0.1:3000 на VPS.
+# Публичного эндпоинта нет, TLS не нужен: трафик идёт внутри SSH-соединения.
+#
+# Перед запуском экспортируйте токен. Он НЕ хранится в этом файле: репозиторий
+# публичный, поэтому секрет читается из локального .env.vps (в .gitignore).
+#   set -a; . ./.env.vps; set +a
+#   export OPEN_METEO_MCP_TOKEN="$MCP_AUTH_TOKEN"
+#
+# Туннель должен быть поднят (LaunchAgent com.user.open-meteo-mcp-tunnel).
+# Проверка: curl -s http://127.0.0.1:3000/healthz
+#
+# Запуск:
+#   dsh web --patch "$PWD/deploy/dsh-mcp-overlay.vps.yml"
+#
+# Инструменты будут видны модели как:
+#   mcp__open_meteo__geocode_location
+#   mcp__open_meteo__get_current_weather
+#   mcp__open_meteo__get_weather_forecast
+#   mcp__open_meteo__get_air_quality
+
+- insert:
+    - id: weather-open-meteo-vps
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: open_meteo
+        transport: streamable-http
+        # Локальный адрес туннеля, а не адрес VPS: сервер опубликован только
+        # на loopback VPS и снаружи недостижим.
+        url: http://127.0.0.1:3000/mcp
+        headers:
+          # Токен читается из окружения, чтобы не коммитить секрет в файл.
+          # Значение — JS-выражение В КАВЫЧКАХ YAML. Обратная кавычка в YAML
+          # зарезервирована, поэтому шаблонная строка (`...${...}`) здесь
+          # недопустима: разбор падает с YAMLException.
+          Authorization: !!js "'Bearer ' + (process.env.OPEN_METEO_MCP_TOKEN ?? '')"
+        # Должно быть больше, чем OPEN_METEO_TIMEOUT_MS * (OPEN_METEO_MAX_RETRIES + 1).
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10
