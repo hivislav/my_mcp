@@ -1,6 +1,23 @@
 import type { Clients } from '../open-meteo/client.js';
 import { InvalidInputError, OpenMeteoError } from '../open-meteo/errors.js';
 import type { GeoResult } from '../open-meteo/types.js';
+import type { ToolDeps } from './deps.js';
+
+/**
+ * Resolves the forecast endpoint from configuration.
+ *
+ * The path and the `models` parameter travel together: the standard forecast
+ * host wants `/v1/forecast` and takes no `models`, while the ensemble host wants
+ * `/v1/ensemble` and rejects the default `best_match` unless a model is named.
+ * Keeping them in one place stops the two tools from drifting apart.
+ */
+export function forecastTarget(config: ToolDeps['config']): { path: string; models: string | undefined } {
+  const models = config.openMeteo.models.trim();
+  return {
+    path: config.openMeteo.forecastPath,
+    models: models === '' ? undefined : models,
+  };
+}
 
 export interface ResolvedLocation {
   name: string;

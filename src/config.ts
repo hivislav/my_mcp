@@ -34,8 +34,23 @@ export interface Config {
     jsonResponse: boolean;
   };
   openMeteo: {
-    /** Overridable so a self-hosted Open-Meteo instance or a proxy can be used. */
+    /**
+     * Overridable so a self-hosted Open-Meteo instance, a proxy, or an
+     * alternative Open-Meteo host can be used.
+     *
+     * The default is NOT `api.open-meteo.com`: that host is unreachable from some
+     * networks (the bare IP blackholes while every other Open-Meteo host answers).
+     * The ensemble host serves the identical JSON schema — same variable names,
+     * same WMO weather codes, same units — so it is a drop-in replacement.
+     */
     forecastBaseUrl: string;
+    /** `/v1/forecast` on the standard host, `/v1/ensemble` on the ensemble host. */
+    forecastPath: string;
+    /**
+     * Comma-separated model ids sent as `models=`. Required by the ensemble host
+     * (it rejects `best_match`); must be empty for the standard forecast host.
+     */
+    models: string;
     geocodingBaseUrl: string;
     airQualityBaseUrl: string;
     /** Free tier needs no key; a commercial key can be supplied here. */
@@ -57,6 +72,11 @@ function envStr(name: string): string | undefined {
   if (raw === undefined) return undefined;
   const trimmed = raw.trim();
   return trimmed === '' ? undefined : trimmed;
+}
+
+/** Like `envStr`, but preserves an explicitly blank value as an empty string. */
+function rawTrim(name: string): string {
+  return (process.env[name] ?? '').trim();
 }
 
 function envBool(name: string, fallback: boolean): boolean {
@@ -146,7 +166,12 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
       jsonResponse: envBool('MCP_JSON_RESPONSE', true),
     },
     openMeteo: {
-      forecastBaseUrl: envUrl('OPEN_METEO_FORECAST_URL', 'https://api.open-meteo.com'),
+      forecastBaseUrl: envUrl('OPEN_METEO_FORECAST_URL', 'https://ensemble-api.open-meteo.com'),
+      forecastPath: envStr('OPEN_METEO_FORECAST_PATH') ?? '/v1/ensemble',
+      // An unset variable keeps the default model. An explicitly blank value
+      // means "send no models parameter", which is what the standard forecast
+      // host wants so it can pick its own best_match.
+      models: process.env['OPEN_METEO_MODELS'] === undefined ? 'gfs05' : rawTrim('OPEN_METEO_MODELS'),
       geocodingBaseUrl: envUrl('OPEN_METEO_GEOCODING_URL', 'https://geocoding-api.open-meteo.com'),
       airQualityBaseUrl: envUrl('OPEN_METEO_AIR_QUALITY_URL', 'https://air-quality-api.open-meteo.com'),
       apiKey: envStr('OPEN_METEO_API_KEY'),

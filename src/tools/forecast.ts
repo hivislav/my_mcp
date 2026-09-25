@@ -6,7 +6,7 @@ import type { ToolDeps } from './deps.js';
 import { num, series, str } from './coerce.js';
 import { formatLines, guard, toolResult, unitsFor, upstreamParamsFor } from './result.js';
 import { locationInputShape, locationOutputShape, locationPayload, placeLabel } from './schemas.js';
-import { assertNoUpstreamError, resolveLocation, round } from './shared.js';
+import { assertNoUpstreamError, forecastTarget, resolveLocation, round } from './shared.js';
 
 const DAILY_VARIABLES = [
   'weather_code',
@@ -96,7 +96,13 @@ export function registerForecastTool(server: McpServer, deps: ToolDeps): void {
               rain_sum: z.number().nullable().describe('Total rainfall for the day.'),
               snowfall_sum: z.number().nullable().describe('Total snowfall for the day, in centimetres.'),
               precipitation_hours: z.number().nullable().describe('Number of hours with precipitation.'),
-              precipitation_probability_max: z.number().nullable().describe('Maximum precipitation probability, percent.'),
+              precipitation_probability_max: z
+                .number()
+                .nullable()
+                .describe(
+                  'Maximum precipitation probability, percent, or null when the configured data source does not ' +
+                    'provide it. The default ensemble source does not; the standard forecast source does.',
+                ),
               uv_index_max: z.number().nullable().describe('Maximum UV index. Values of 3+ warrant sun protection.'),
               wind_speed_max: z.number().nullable().describe('Maximum wind speed at 10 m.'),
               wind_gusts_max: z.number().nullable().describe('Maximum wind gust at 10 m.'),
@@ -115,7 +121,10 @@ export function registerForecastTool(server: McpServer, deps: ToolDeps): void {
               apparent_temperature: z.number().nullable().describe('Feels-like temperature.'),
               relative_humidity: z.number().nullable().describe('Relative humidity, percent.'),
               precipitation: z.number().nullable().describe('Precipitation in that hour.'),
-              precipitation_probability: z.number().nullable().describe('Precipitation probability, percent.'),
+              precipitation_probability: z
+                .number()
+                .nullable()
+                .describe('Precipitation probability, percent, or null when the data source does not provide it.'),
               weather_code: z.number().nullable().describe('WMO weather code for that hour.'),
               cloud_cover: z.number().nullable().describe('Cloud cover, percent.'),
               wind_speed: z.number().nullable().describe('Wind speed at 10 m.'),
@@ -151,13 +160,15 @@ export function registerForecastTool(server: McpServer, deps: ToolDeps): void {
             { defaultLanguage: language },
           );
 
-          const payload = await deps.clients.forecast.getJson<ForecastResponse>('/v1/forecast', {
+          const target = forecastTarget(deps.config);
+          const payload = await deps.clients.forecast.getJson<ForecastResponse>(target.path, {
             latitude: resolved.latitude,
             longitude: resolved.longitude,
             daily: [...DAILY_VARIABLES],
             hourly: include_hourly ? [...HOURLY_VARIABLES] : undefined,
             forecast_days: days,
             timezone: 'auto',
+            models: target.models,
             ...upstreamParamsFor(units),
           });
           assertNoUpstreamError(payload, 'Forecast request was rejected');

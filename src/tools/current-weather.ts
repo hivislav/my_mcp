@@ -6,7 +6,7 @@ import type { ToolDeps } from './deps.js';
 import { bool, num, str } from './coerce.js';
 import { formatLines, guard, toolResult, unitsFor, upstreamParamsFor } from './result.js';
 import { locationInputShape, locationOutputShape, locationPayload, placeLabel } from './schemas.js';
-import { assertNoUpstreamError, resolveLocation, round } from './shared.js';
+import { assertNoUpstreamError, forecastTarget, resolveLocation, round } from './shared.js';
 
 /** Current conditions offered by the free forecast endpoint. */
 const CURRENT_VARIABLES = [
@@ -91,11 +91,13 @@ export function registerCurrentWeatherTool(server: McpServer, deps: ToolDeps): v
             { defaultLanguage: language },
           );
 
-          const payload = await deps.clients.forecast.getJson<ForecastResponse>('/v1/forecast', {
+          const target = forecastTarget(deps.config);
+          const payload = await deps.clients.forecast.getJson<ForecastResponse>(target.path, {
             latitude: resolved.latitude,
             longitude: resolved.longitude,
             current: [...CURRENT_VARIABLES],
             timezone: 'auto',
+            models: target.models,
             ...upstreamParamsFor(units),
           });
           assertNoUpstreamError(payload, 'Current weather request was rejected');

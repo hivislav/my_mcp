@@ -6,6 +6,7 @@ import { OpenMeteoClient } from '../src/open-meteo/client.js';
 import { OpenMeteoError } from '../src/open-meteo/errors.js';
 import { decodeWeatherCode } from '../src/open-meteo/weather-codes.js';
 import { bool, num, series, str } from '../src/tools/coerce.js';
+import { forecastTarget } from '../src/tools/shared.js';
 
 const TOUCHED = [
   'MCP_TRANSPORT',
@@ -21,6 +22,8 @@ const TOUCHED = [
   'OPEN_METEO_TIMEOUT_MS',
   'OPEN_METEO_MAX_RETRIES',
   'OPEN_METEO_FORECAST_URL',
+  'OPEN_METEO_FORECAST_PATH',
+  'OPEN_METEO_MODELS',
   'OPEN_METEO_API_KEY',
   'LOG_LEVEL',
 ] as const;
@@ -86,7 +89,11 @@ describe('configuration', () => {
     assert.equal(config.http.port, 3000);
     assert.equal(config.http.path, '/mcp');
     assert.equal(config.http.sessionMode, 'stateless');
-    assert.equal(config.openMeteo.forecastBaseUrl, 'https://api.open-meteo.com');
+    // The default host must not be `api.open-meteo.com`: that host is blocked on
+    // some networks, so the reachable ensemble host is the default instead.
+    assert.equal(config.openMeteo.forecastBaseUrl, 'https://ensemble-api.open-meteo.com');
+    assert.equal(config.openMeteo.forecastPath, '/v1/ensemble');
+    assert.equal(config.openMeteo.models, 'gfs05');
     assert.equal(config.openMeteo.maxRetries, 2);
   });
 
@@ -142,6 +149,28 @@ describe('configuration', () => {
     clearEnv();
     process.env['MCP_ALLOWED_ORIGINS'] = '*';
     assert.deepEqual(loadConfig([]).http.allowedOrigins, ['*']);
+  });
+
+  it('lets a blank OPEN_METEO_MODELS switch back to the standard forecast host', () => {
+    // An unset variable keeps the ensemble default...
+    clearEnv();
+    assert.deepEqual(forecastTarget(loadConfig([])), { path: '/v1/ensemble', models: 'gfs05' });
+
+    // ...but an explicitly blank one must send no `models` at all, otherwise
+    // there would be no way to get the standard host's own best_match model.
+    clearEnv();
+    process.env['OPEN_METEO_MODELS'] = '';
+    process.env['OPEN_METEO_FORECAST_URL'] = 'https://api.open-meteo.com';
+    process.env['OPEN_METEO_FORECAST_PATH'] = '/v1/forecast';
+    const target = forecastTarget(loadConfig([]));
+    assert.equal(target.path, '/v1/forecast');
+    assert.equal(target.models, undefined);
+  });
+
+  it('treats a whitespace-only model list as absent', () => {
+    clearEnv();
+    process.env['OPEN_METEO_MODELS'] = '   ';
+    assert.equal(forecastTarget(loadConfig([])).models, undefined);
   });
 });
 

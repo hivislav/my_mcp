@@ -21,7 +21,7 @@ let upstream: MockUpstream;
 let client: Client;
 let server: ReturnType<typeof createServer>;
 
-function makeConfig(baseUrl: string): Config {
+function makeConfig(baseUrl: string, overrides: Partial<Config['openMeteo']> = {}): Config {
   return {
     transport: 'stdio',
     http: {
@@ -37,14 +37,33 @@ function makeConfig(baseUrl: string): Config {
     },
     openMeteo: {
       forecastBaseUrl: baseUrl,
+      // Exercise the default ensemble backend so the suite matches production.
+      forecastPath: '/v1/ensemble',
+      models: 'gfs05',
       geocodingBaseUrl: baseUrl,
       airQualityBaseUrl: baseUrl,
       apiKey: undefined,
       timeoutMs: 5000,
       maxRetries: 1,
       userAgent: 'open-meteo-mcp-test/1.0.0',
+      ...overrides,
     },
     logLevel: 'silent',
+  };
+}
+
+/** Boots an isolated client/server pair so a test can vary the configuration. */
+async function connectWith(config: Config): Promise<{ client: Client; close: () => Promise<void> }> {
+  const server = createServer(buildDeps(config, createLogger('silent')));
+  const isolated = new Client({ name: 'test-client-isolated', version: '1.0.0' }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([isolated.connect(clientTransport), server.connect(serverTransport)]);
+  return {
+    client: isolated,
+    close: async () => {
+      await isolated.close();
+      await server.close();
+    },
   };
 }
 
@@ -203,7 +222,7 @@ describe('get_current_weather', () => {
     assert.equal(units['temperature'], '°F');
     assert.equal(units['wind_speed'], 'mph');
 
-    const lastForecast = upstream.requests.filter((r) => r.path === '/v1/forecast').at(-1);
+    const lastForecast = upstream.requests.filter((r) => r.path === '/v1/ensemble').at(-1);
     assert.equal(lastForecast?.query.get('temperature_unit'), 'fahrenheit');
     assert.equal(lastForecast?.query.get('wind_speed_unit'), 'mph');
   });
@@ -284,8 +303,29 @@ describe('get_weather_forecast', () => {
   it('forwards the requested day count upstream', async () => {
     upstream.requests.length = 0;
     await call('get_weather_forecast', { location: 'Moscow', days: 10 });
-    const request = upstream.requests.find((r) => r.path === '/v1/forecast');
+    const request = upstream.requests.find((r) => r.path === '/v1/ensemble');
     assert.equal(request?.query.get('forecast_days'), '10');
+  });
+
+  it('uses the configured forecast path and sends the configured model', async () => {
+    // The ensemble backend rejects `best_match`, so the model id must be sent;
+    // and the request must go to the configured path, not a hardcoded one.
+    upstream.requests.length = 0;
+    await call('get_weather_forecast', { location: 'Moscow', days: 3 });
+
+    const forecastRequests = upstream.requests.filter(
+      (r) => r.path === '/v1/ensemble' || r.path === '/v1/forecast',
+    );
+    assert.equal(forecastRequests.length, 1, 'exactly one forecast request expected');
+    assert.equal(forecastRequests[0]?.path, '/v1/ensemble');
+    assert.equal(forecastRequests[0]?.query.get('models'), 'gfs05');
+  });
+
+  it('also sends the model on current-weather requests', async () => {
+    upstream.requests.length = 0;
+    await call('get_current_weather', { location: 'Moscow' });
+    const request = upstream.requests.find((r) => r.path === '/v1/ensemble');
+    assert.equal(request?.query.get('models'), 'gfs05');
   });
 
   it('rejects a day count beyond the free-tier horizon', async () => {
@@ -316,6 +356,37 @@ describe('get_air_quality', () => {
     assert.notEqual(result.isError, true);
     const data = structured<Record<string, unknown>>(result);
     assert.equal((data['location'] as Record<string, unknown>)['resolvedFrom'], null);
+  });
+});
+
+describe('switching the forecast backend (the VPS configuration)', () => {
+  it('talks to the standard forecast host when configured that way', async () => {
+    // This is the configuration a VPS uses: the real api.open-meteo.com, which
+    // also restores precipitation probability that the ensemble host lacks.
+    upstream.requests.length = 0;
+    const session = await connectWith(
+      makeConfig(upstream.url, {
+        forecastPath: '/v1/forecast',
+        models: '',
+      }),
+    );
+
+    try {
+      const result = (await session.client.callTool({
+        name: 'get_weather_forecast',
+        arguments: { location: 'Moscow', days: 3 },
+      })) as CallToolResult;
+
+      assert.notEqual(result.isError, true, firstText(result));
+
+      const requests = upstream.requests.filter((r) => r.path === '/v1/forecast' || r.path === '/v1/ensemble');
+      assert.equal(requests.length, 1, 'one forecast request expected');
+      assert.equal(requests[0]?.path, '/v1/forecast', 'must use the standard path');
+      // The standard host picks its own best_match when no model is named.
+      assert.equal(requests[0]?.query.get('models'), null);
+    } finally {
+      await session.close();
+    }
   });
 });
 

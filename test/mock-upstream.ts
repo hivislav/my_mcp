@@ -71,7 +71,10 @@ export async function startMockUpstream(): Promise<MockUpstream> {
     requests.push({ path: url.pathname, query: url.searchParams, headers: req.headers });
 
     if (url.pathname === '/v1/search') return handleSearch(url, res);
-    if (url.pathname === '/v1/forecast') return handleForecast(url, res);
+    // The server's default backend is the ensemble host, which serves the same
+    // JSON schema from a different path. Both are mocked so the suite covers
+    // whichever backend the configuration points at.
+    if (url.pathname === '/v1/forecast' || url.pathname === '/v1/ensemble') return handleForecast(url, res);
     if (url.pathname === '/v1/air-quality') return handleAirQuality(url, res);
 
     sendJson(res, 404, { error: true, reason: `Unknown endpoint ${url.pathname}` });
