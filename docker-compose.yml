@@ -1,0 +1,52 @@
+services:
+  open-meteo-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: open-meteo-mcp:1.0.0
+    container_name: open-meteo-mcp
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # Inside the container the process must bind all interfaces; the published
+      # port below decides what is actually reachable from outside.
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 3000
+
+    # Publish on loopback only. Put nginx/Caddy/Traefik in front for TLS, and
+    # change this to "3000:3000" only if the network itself is trusted.
+    ports:
+      - "127.0.0.1:3000:3000"
+
+    # If a token is set but you still want a hard guard against accidentally
+    # exposing the service, keep this assertion enabled: the container refuses
+    # to start when no token is configured.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    # The server is stateless and holds no data; read-only root plus a tmpfs is
+    # enough, and drops the ability to write anywhere in the image.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

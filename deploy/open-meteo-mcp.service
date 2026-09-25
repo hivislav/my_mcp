@@ -1,0 +1,57 @@
+# systemd unit for running the MCP server directly on a VPS (no Docker).
+#
+# Install:
+#   sudo useradd --system --home /opt/open-meteo-mcp --shell /usr/sbin/nologin mcp
+#   sudo rsync -a --delete dist/ node_modules/ package.json /opt/open-meteo-mcp/
+#   sudo cp deploy/open-meteo-mcp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now open-meteo-mcp
+#
+# Secrets belong in the EnvironmentFile, not in this unit (which is world-readable).
+
+[Unit]
+Description=Open-Meteo MCP server
+Documentation=https://github.com/your-org/open-meteo-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcp
+Group=mcp
+WorkingDirectory=/opt/open-meteo-mcp
+
+# Copy .env.example to /etc/open-meteo-mcp.env and fill it in, then:
+#   sudo chmod 600 /etc/open-meteo-mcp.env
+#   sudo chown root:root /etc/open-meteo-mcp.env
+EnvironmentFile=/etc/open-meteo-mcp.env
+
+# These override anything in the EnvironmentFile: the service always speaks HTTP
+# and relies on a reverse proxy for TLS.
+Environment=MCP_TRANSPORT=http
+Environment=MCP_HOST=127.0.0.1
+Environment=MCP_PORT=3000
+
+ExecStart=/usr/bin/node /opt/open-meteo-mcp/dist/index.js --transport http
+
+Restart=on-failure
+RestartSec=3
+
+# --- hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# The process only needs to make outbound HTTPS calls and serve one port.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

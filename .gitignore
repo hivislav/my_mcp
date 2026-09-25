@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+
+# Secrets — never commit the real environment file
+.env
+.env.*
+!.env.example
+
+# Local npm cache used when the global cache is unusable
+.npm-cache/
+
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/
+*.tsbuildinfo

@@ -1,0 +1,71 @@
+# Ready-to-use DSH overlay for the Open-Meteo MCP server.
+#
+# Apply it with:
+#   dsh web --patch "$PWD/deploy/dsh-mcp-overlay.example.yml"
+#
+# Tools are exposed to the model as mcp__<serverName>__<tool>, so with the config
+# below they appear as:
+#   mcp__open_meteo__geocode_location
+#   mcp__open_meteo__get_current_weather
+#   mcp__open_meteo__get_weather_forecast
+#   mcp__open_meteo__get_air_quality
+#
+# serverName must match [A-Za-z0-9_-]{1,32} — dots and spaces are rejected.
+
+# ---------------------------------------------------------------------------
+# Option A — local stdio. DSH spawns the process and supervises its lifecycle.
+#
+# Prepare once, from the project directory:
+#   npm install && npm run build && npm link
+#
+# `npm link` puts the `open-meteo-mcp` bin (declared in package.json) on PATH,
+# which is exactly how the DSH mcp-memory examples reference their servers.
+# If you would rather not link globally, replace `command` with the absolute
+# path to your Node executable and put the absolute path to dist/index.js first
+# in `args`.
+# ---------------------------------------------------------------------------
+- insert:
+    - id: weather-open-meteo
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: open_meteo
+        transport: stdio
+        command: open-meteo-mcp
+        args:
+          - --transport
+          - stdio
+        env:
+          LOG_LEVEL: warn
+          # OPEN_METEO_TIMEOUT_MS: '15000'
+          # OPEN_METEO_MAX_RETRIES: '2'
+        cwd: !!js process.cwd()
+        # Must exceed OPEN_METEO_TIMEOUT_MS * (OPEN_METEO_MAX_RETRIES + 1).
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
+
+# ---------------------------------------------------------------------------
+# Option B — remote Streamable HTTP on your VPS.
+# Remove Option A and uncomment this block instead. The remote service must
+# already be running; DSH does not supervise a remote HTTP server.
+#
+# The token is read from the environment rather than pasted here, because this
+# file is likely to be committed.
+#
+# Export it first:  export OPEN_METEO_MCP_TOKEN=$(openssl rand -hex 32)
+# ---------------------------------------------------------------------------
+# - insert:
+#     - id: weather-open-meteo-remote
+#       name: '@deepseek-ai/dsh-mcp-client'
+#       config:
+#         serverName: open_meteo
+#         transport: streamable-http
+#         url: https://mcp.example.com/mcp
+#         headers:
+#           Authorization: !!js `Bearer ${process.env.OPEN_METEO_MCP_TOKEN ?? ''}`
+#         toolCallTimeoutMs: 60000
+#         failOnStartupError: true
+#         reconnect:
+#           enabled: true
+#           initialDelayMs: 500
+#           maxDelayMs: 30000
+#           maxAttempts: 10
