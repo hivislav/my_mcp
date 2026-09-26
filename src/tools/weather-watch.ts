@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { InvalidInputError } from '../errors.js';
 import type { WatchService } from '../watch/service.js';
 import { isEnabled, type WatchDefinition } from '../watch/types.js';
+import { slugify } from '../slug.js';
 import { isValidWatchId, sanitiseId } from '../watch/store.js';
 import type { ToolDeps } from './deps.js';
 import { formatLines, guard, toolResult } from './result.js';
@@ -63,13 +64,9 @@ function deriveWatchId(
 ): string {
   const coordinateFallback = `point-${resolved.latitude.toFixed(2)}-${resolved.longitude.toFixed(2)}`;
 
-  // Transliterate before slugging: a pure ASCII slug regex would reduce "Москва"
-  // to an empty string and silently produce the generic id "watch".
-  const transliterated = resolved.fromCoordinates ? '' : transliterate(resolved.name);
-  const slug = transliterated
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
+  // Transliteration happens inside `slugify`: a pure ASCII slug regex would reduce
+  // "Москва" to an empty string and silently produce the generic id "watch".
+  const slug = resolved.fromCoordinates ? '' : slugify(resolved.name);
 
   const base = sanitiseId(slug) || sanitiseId(coordinateFallback) || 'watch';
 
@@ -80,28 +77,6 @@ function deriveWatchId(
   }
   // Fall back to a time-derived id rather than looping forever.
   return `${base}-${Date.now().toString(36)}`;
-}
-
-/**
- * Cyrillic to Latin, so Russian place names produce readable ASCII ids.
- *
- * Ids end up in filenames and in every later tool call, so "moskva" is far more
- * usable than a generic fallback or a percent-encoded name. Non-Cyrillic scripts
- * pass through unchanged and fall back to coordinates if nothing survives.
- */
-const CYRILLIC: Record<string, string> = {
-  а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z',
-  и: 'i', й: 'y', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r',
-  с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts', ч: 'ch', ш: 'sh',
-  щ: 'shch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
-};
-
-function transliterate(value: string): string {
-  let output = '';
-  for (const character of value.toLowerCase()) {
-    output += CYRILLIC[character] ?? character;
-  }
-  return output;
 }
 
 /**

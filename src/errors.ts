@@ -73,3 +73,17 @@ export class WatchLimitError extends AppError {
     );
   }
 }
+
+/** Saved summaries cannot be stored, e.g. a read-only filesystem with no volume. */
+export class SummaryUnavailableError extends AppError {
+  constructor(reason: string) {
+    super(reason);
+  }
+}
+
+/** A saved-summary limit was exceeded (too many datasets, or too many rows). */
+export class SummaryLimitError extends AppError {
+  constructor(message: string) {
+    super(message);
+  }
+}

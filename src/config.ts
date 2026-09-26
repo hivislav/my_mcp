@@ -6,6 +6,8 @@
  * both places without a code change.
  */
 
+import { join } from 'node:path';
+
 export type TransportKind = 'stdio' | 'http';
 export type SessionMode = 'stateless' | 'stateful';
 
@@ -73,6 +75,27 @@ export interface Config {
      */
     dataDir: string;
     maxWatches: number;
+  };
+  summary: {
+    /**
+     * Directory holding one JSON file per saved summary plus index.json, with
+     * generated .xlsx files under `exports/`. Must be writable for the summary
+     * tools to work; defaults to `<WATCH_DATA_DIR>/summaries` so a single volume
+     * covers both features.
+     */
+    dataDir: string;
+    /** Maximum number of saved summaries. */
+    maxDatasets: number;
+    /** Maximum rows in one saved summary. */
+    maxEntries: number;
+    /**
+     * Largest .xlsx that is additionally returned inline as base64. Bigger files
+     * are still written to disk and reported by path, but not embedded — a huge
+     * blob in a single MCP message is a poor trade on a metered connection.
+     */
+    maxInlineBytes: number;
+    /** How many generated .xlsx files to keep per dataset before pruning the oldest. */
+    maxExportsPerDataset: number;
   };
   logLevel: LogLevel;
 }
@@ -201,6 +224,15 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
       retentionHours: envInt('WATCH_RETENTION_HOURS', 168, 1, 8760),
       dataDir: envStr('WATCH_DATA_DIR') ?? './data',
       maxWatches: envInt('WATCH_MAX_WATCHES', 20, 1, 500),
+    },
+    summary: {
+      // Defaults inside the watch data directory so one mounted volume (and one
+      // chown in the deploy steps) covers both persisted features.
+      dataDir: envStr('SUMMARY_DATA_DIR') ?? join(envStr('WATCH_DATA_DIR') ?? './data', 'summaries'),
+      maxDatasets: envInt('SUMMARY_MAX_DATASETS', 200, 1, 10_000),
+      maxEntries: envInt('SUMMARY_MAX_ENTRIES', 5000, 1, 100_000),
+      maxInlineBytes: envInt('SUMMARY_MAX_INLINE_BYTES', 8_388_608, 0, 256 * 1024 * 1024),
+      maxExportsPerDataset: envInt('SUMMARY_MAX_EXPORTS', 10, 1, 1000),
     },
     logLevel: logLevelRaw as LogLevel,
   };

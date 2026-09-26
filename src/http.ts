@@ -83,6 +83,15 @@ export async function startHttpServer(config: Config, deps: ToolDeps, logger: Lo
           watchCount: watches.length,
           failingWatches: watches.filter((entry) => !entry.healthy).map((entry) => entry.definition.id),
         },
+        // Saved summaries use a separate directory under the same volume, so a
+        // path that breaks only Excel export is visible here rather than showing up
+        // for the first time as a failed tool call.
+        summaries: {
+          available: deps.summaries.unavailableReason === null,
+          unavailableReason: deps.summaries.unavailableReason,
+          dataDir: deps.summaries.dataDir,
+          exportsDir: deps.summaries.exportsDir,
+        },
       });
       return;
     }

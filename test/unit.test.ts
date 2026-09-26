@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { assertSafeHttpBinding, loadConfig } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
@@ -30,6 +31,11 @@ const TOUCHED = [
   'WATCH_RETENTION_HOURS',
   'WATCH_DATA_DIR',
   'WATCH_MAX_WATCHES',
+  'SUMMARY_DATA_DIR',
+  'SUMMARY_MAX_DATASETS',
+  'SUMMARY_MAX_ENTRIES',
+  'SUMMARY_MAX_INLINE_BYTES',
+  'SUMMARY_MAX_EXPORTS',
   'LOG_LEVEL',
 ] as const;
 
@@ -196,6 +202,35 @@ describe('configuration', () => {
     assert.equal(config.watch.retentionHours, 24);
     assert.equal(config.watch.dataDir, '/var/lib/open-meteo-mcp');
     assert.equal(config.watch.maxWatches, 3);
+  });
+
+  it('keeps saved summaries inside the watch data directory by default', () => {
+    // One mounted volume has to cover both persisted features: the deploy steps
+    // chown a single ./data directory, and a second default path outside it would
+    // silently write to a read-only container filesystem.
+    clearEnv();
+    const config = loadConfig([]);
+    assert.equal(config.summary.dataDir, join(config.watch.dataDir, 'summaries'));
+    assert.equal(config.summary.maxDatasets, 200);
+    assert.equal(config.summary.maxEntries, 5000);
+    assert.equal(config.summary.maxInlineBytes, 8_388_608);
+    assert.equal(config.summary.maxExportsPerDataset, 10);
+  });
+
+  it('reads summary settings from the environment', () => {
+    clearEnv();
+    process.env['SUMMARY_DATA_DIR'] = '/var/lib/open-meteo-mcp/summaries';
+    process.env['SUMMARY_MAX_DATASETS'] = '5';
+    process.env['SUMMARY_MAX_ENTRIES'] = '100';
+    process.env['SUMMARY_MAX_INLINE_BYTES'] = '0';
+    process.env['SUMMARY_MAX_EXPORTS'] = '2';
+
+    const config = loadConfig([]);
+    assert.equal(config.summary.dataDir, '/var/lib/open-meteo-mcp/summaries');
+    assert.equal(config.summary.maxDatasets, 5);
+    assert.equal(config.summary.maxEntries, 100);
+    assert.equal(config.summary.maxInlineBytes, 0);
+    assert.equal(config.summary.maxExportsPerDataset, 2);
   });
 
   it('rejects a collection interval below the safety floor', () => {

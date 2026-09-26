@@ -9,6 +9,10 @@
 #   mcp__open_meteo__get_current_weather
 #   mcp__open_meteo__get_weather_forecast
 #   mcp__open_meteo__get_air_quality
+#   mcp__open_meteo__list_weather_watches
+#   mcp__open_meteo__save_weather_summary
+#   mcp__open_meteo__list_weather_summaries
+#   mcp__open_meteo__export_weather_summary_excel
 #
 # serverName must match [A-Za-z0-9_-]{1,32} — dots and spaces are rejected.
 

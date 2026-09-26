@@ -29,6 +29,9 @@ const CHECKS: Check[] = [
   // Read-only, so the smoke test never registers or deletes a watch: it only
   // confirms the collector is reachable and reports its interval.
   { tool: 'list_weather_watches', args: {} },
+  // Also read-only: it reports which summaries exist and where they are stored,
+  // without saving or exporting anything.
+  { tool: 'list_weather_summaries', args: {} },
 ];
 
 function argValue(flag: string): string | undefined {
@@ -37,7 +40,7 @@ function argValue(flag: string): string | undefined {
 }
 
 /** Env prefixes that must reach the spawned server. */
-const FORWARDED_ENV = /^(LOG_LEVEL|MCP_|OPEN_METEO_)/;
+const FORWARDED_ENV = /^(LOG_LEVEL|MCP_|OPEN_METEO_|WATCH_|SUMMARY_)/;
 
 /**
  * The MCP SDK's `getDefaultEnvironment()` deliberately scrubs the ambient

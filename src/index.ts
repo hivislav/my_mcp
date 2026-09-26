@@ -10,6 +10,10 @@ const HELP = `${SERVER_NAME} ${SERVER_VERSION}
 
 MCP server for the free Open-Meteo weather and air-quality APIs.
 
+Besides reading weather, it can keep a table of values on disk
+(save_weather_summary) and turn it into an .xlsx file
+(export_weather_summary_excel).
+
 Usage:
   open-meteo-mcp [--transport stdio|http] [--help]
 
@@ -37,6 +41,12 @@ Environment:
   WATCH_RETENTION_HOURS                How long samples are kept (default 168 = 7 days)
   WATCH_DATA_DIR                       Where watches.json and samples/ live (default ./data)
   WATCH_MAX_WATCHES                    Maximum concurrent watches (default 20)
+  SUMMARY_DATA_DIR                     Where saved summaries and .xlsx exports live
+                                       (default <WATCH_DATA_DIR>/summaries)
+  SUMMARY_MAX_DATASETS                 Maximum saved summaries (default 200)
+  SUMMARY_MAX_ENTRIES                  Maximum rows in one saved summary (default 5000)
+  SUMMARY_MAX_INLINE_BYTES             Largest .xlsx returned inline, base64 (default 8388608)
+  SUMMARY_MAX_EXPORTS                  .xlsx files kept per dataset (default 10)
   LOG_LEVEL                            debug | info | warn | error | silent
 
 See .env.example and README.md for details.
@@ -67,6 +77,11 @@ async function main(): Promise<void> {
   } else {
     logger.info('weather watcher disabled by configuration (WATCH_ENABLED=false)');
   }
+
+  // Probed once at startup rather than on the first tool call: a data directory
+  // that cannot be written is a deployment mistake, and it should be visible in
+  // /healthz and in the logs before anyone depends on it.
+  await deps.summaries.initialise();
 
   if (config.transport === 'stdio') {
     await runStdio(config, deps, logger);

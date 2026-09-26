@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -12,6 +13,7 @@ import { buildDeps, createServer } from '../src/server.js';
 import type { ToolDeps } from '../src/tools/deps.js';
 import { WatchService } from '../src/watch/service.js';
 import { WatchStore } from '../src/watch/store.js';
+import { METRIC_KEYS } from '../src/summary/metrics.js';
 import { TOOL_NAMES } from '../src/tools/index.js';
 import { startMockUpstream, type MockUpstream } from './mock-upstream.js';
 
@@ -34,6 +36,7 @@ function makeConfig(
   watchDataDir: string,
   overrides: Partial<Config['openMeteo']> = {},
   watchOverrides: Partial<Config['watch']> = {},
+  summaryOverrides: Partial<Config['summary']> = {},
 ): Config {
   return {
     transport: 'stdio',
@@ -68,6 +71,14 @@ function makeConfig(
       dataDir: watchDataDir,
       maxWatches: 20,
       ...watchOverrides,
+    },
+    summary: {
+      dataDir: join(watchDataDir, 'summaries'),
+      maxDatasets: 200,
+      maxEntries: 5000,
+      maxInlineBytes: 8_388_608,
+      maxExportsPerDataset: 10,
+      ...summaryOverrides,
     },
     logLevel: 'silent',
   };
@@ -201,6 +212,15 @@ describe('tool registration and parameter descriptions', () => {
     assert.equal(byName.get('delete_weather_watch')?.annotations?.readOnlyHint, false);
     assert.equal(byName.get('delete_weather_watch')?.annotations?.destructiveHint, true);
 
+    // Saving a summary and exporting a workbook both write to the data
+    // directory, so neither may be advertised as read-only.
+    assert.equal(byName.get('save_weather_summary')?.annotations?.readOnlyHint, false);
+    assert.equal(byName.get('export_weather_summary_excel')?.annotations?.readOnlyHint, false);
+    // Nothing here destroys earlier work: overwriting a dataset needs an explicit
+    // replace: true, and exporting only adds a new file.
+    assert.equal(byName.get('save_weather_summary')?.annotations?.destructiveHint, false);
+    assert.equal(byName.get('export_weather_summary_excel')?.annotations?.destructiveHint, false);
+
     for (const name of [
       'geocode_location',
       'get_current_weather',
@@ -208,6 +228,7 @@ describe('tool registration and parameter descriptions', () => {
       'get_air_quality',
       'list_weather_watches',
       'get_weather_watch_report',
+      'list_weather_summaries',
     ]) {
       assert.equal(byName.get(name)?.annotations?.readOnlyHint, true, `${name} should be read-only`);
       assert.equal(byName.get(name)?.annotations?.destructiveHint, false, `${name} should be non-destructive`);
@@ -1054,5 +1075,364 @@ describe('reports are self-contained about time', () => {
       Math.abs(expected - agg.staleness_minutes!) <= 1,
       `staleness (${agg.staleness_minutes}) should match the gap to generated_at (${expected})`,
     );
+  });
+});
+
+describe('saved weather summaries', () => {
+  const DATASET = 'goroda-sravnenie';
+
+  it('stores agent-supplied rows and says where they went', async () => {
+    const result = await call('save_weather_summary', {
+      dataset_id: DATASET,
+      title: 'Сравнение городов, 25 сентября',
+      summary: 'Москва прохладнее Сочи примерно на 12 градусов.',
+      source: 'get_weather_forecast (ensemble gfs05)',
+      tags: ['travel'],
+      entries: [
+        {
+          location: 'Moscow',
+          country: 'Russia',
+          latitude: 55.75204,
+          longitude: 37.61781,
+          date: '2026-09-25',
+          condition: 'Light rain',
+          weather_code: 61,
+          temperature: 12.4,
+          temperature_min: 8.2,
+          temperature_max: 14.9,
+          relative_humidity: 81,
+          precipitation: 1.234,
+          wind_speed: 14.2,
+          extra: { aqi: 42, sunrise: '06:12' },
+        },
+        {
+          location: 'Sochi',
+          date: '2026-09-25',
+          condition: 'Clear sky',
+          weather_code: 0,
+          temperature: 24.1,
+          temperature_min: 19.5,
+          temperature_max: 27.3,
+          relative_humidity: 60,
+          precipitation: 0,
+          wind_speed: 8.8,
+        },
+      ],
+    });
+
+    assert.notEqual(result.isError, true, firstText(result));
+    const data = structured<{
+      dataset: {
+        id: string;
+        entry_count: number;
+        locations: string[];
+        period: { from: string | null; to: string | null };
+        units: string;
+        file_path: string;
+        summary: string | null;
+      };
+      replaced: boolean;
+      derived_id: boolean;
+      next_step: string;
+    }>(result);
+
+    assert.equal(data.dataset.id, DATASET);
+    assert.equal(data.dataset.entry_count, 2);
+    assert.deepEqual(data.dataset.locations, ['Moscow', 'Sochi']);
+    assert.deepEqual(data.dataset.period, { from: '2026-09-25', to: '2026-09-25' });
+    assert.equal(data.dataset.units, 'metric');
+    assert.equal(data.replaced, false);
+    assert.equal(data.derived_id, false);
+    assert.match(data.next_step, /export_weather_summary_excel/);
+
+    // The rows really are on disk, in the mounted data directory, as JSON a human
+    // can read on the host — that is the whole point of "store it locally".
+    const stored = JSON.parse(await readFile(data.dataset.file_path, 'utf8')) as {
+      dataset: { entries: Array<Record<string, unknown>> };
+    };
+    assert.equal(stored.dataset.entries.length, 2);
+    // Precipitation is rounded to the metric's stored precision.
+    assert.equal(stored.dataset.entries[0]?.['precipitation'], 1.23);
+    assert.equal(stored.dataset.entries[0]?.['condition'], 'Light rain');
+  });
+
+  it('applies a dataset-level location to every row', async () => {
+    const result = await call('save_weather_summary', {
+      dataset_id: 'sochi-week',
+      title: 'Сочи, неделя',
+      location: 'Sochi',
+      country: 'Russia',
+      latitude: 43.6,
+      longitude: 39.73,
+      entries: [
+        { date: '2026-09-21', temperature: 22.4, condition: 'Clear sky' },
+        { date: '2026-09-22', temperature: 23.1, condition: 'Partly cloudy' },
+      ],
+    });
+
+    assert.notEqual(result.isError, true, firstText(result));
+    const data = structured<{ dataset: { entry_count: number; locations: string[] } }>(result);
+    assert.equal(data.dataset.entry_count, 2);
+    assert.deepEqual(data.dataset.locations, ['Sochi']);
+
+    const listed = await call('list_weather_summaries', { dataset_id: 'sochi-week', include_entries: true });
+    const detail = structured<{ datasets: Array<{ entries: Array<Record<string, unknown>> }> }>(listed);
+    const entries = detail.datasets[0]?.entries ?? [];
+    assert.equal(entries.length, 2);
+    assert.equal(entries[0]?.['location'], 'Sochi');
+    assert.equal(entries[0]?.['latitude'], 43.6);
+  });
+
+  it('refuses to overwrite a dataset unless replace is explicit', async () => {
+    const result = await call('save_weather_summary', {
+      dataset_id: DATASET,
+      title: 'Сравнение городов',
+      entries: [{ location: 'Moscow', date: '2026-09-26', temperature: 11 }],
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(firstText(result), /replace: true/);
+    assert.match(firstText(result), new RegExp(DATASET));
+
+    const replaced = await call('save_weather_summary', {
+      dataset_id: DATASET,
+      title: 'Сравнение городов, обновлено',
+      replace: true,
+      entries: [
+        { location: 'Moscow', date: '2026-09-25', temperature: 12.4 },
+        { location: 'Sochi', date: '2026-09-25', temperature: 24.1 },
+      ],
+    });
+    assert.notEqual(replaced.isError, true, firstText(replaced));
+    assert.equal(structured<{ replaced: boolean }>(replaced).replaced, true);
+  });
+
+  it('explains what a row is missing instead of saving a nameless place', async () => {
+    const result = await call('save_weather_summary', {
+      dataset_id: 'broken',
+      title: 'Broken',
+      entries: [{ date: '2026-09-25', temperature: 10 }],
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(firstText(result), /no place name/);
+  });
+
+  it('refuses both sources at once', async () => {
+    const result = await call('save_weather_summary', {
+      dataset_id: 'both',
+      title: 'Both',
+      watch_id: 'paris',
+      entries: [{ location: 'Moscow', date: '2026-09-25' }],
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(firstText(result), /not both/);
+  });
+
+  it('turns an existing watch history into one row per day', async () => {
+    await call('start_weather_watch', { id: 'summary-source', location: 'Paris', language: 'en' });
+
+    const result = await call('save_weather_summary', {
+      watch_id: 'summary-source',
+      watch_window_hours: 24,
+      title: 'Paris from the collector',
+    });
+
+    assert.notEqual(result.isError, true, firstText(result));
+    const data = structured<{
+      dataset: { id: string; entry_count: number; locations: string[]; origin: Record<string, unknown> };
+      derived_id: boolean;
+    }>(result);
+
+    assert.equal(data.dataset.origin['kind'], 'watch');
+    assert.equal(data.dataset.origin['watch_id'], 'summary-source');
+    assert.equal(data.dataset.entry_count, 1, 'the fresh watch holds one day of samples');
+    assert.match(data.dataset.locations[0] ?? '', /Paris/);
+    // No dataset_id was passed, so the id comes from the title — which is what
+    // makes a later replace or export possible without a lookup call.
+    assert.equal(data.derived_id, true);
+    assert.equal(data.dataset.id, 'paris-from-the-collector');
+  });
+
+  it('explains how to recover from an unknown watch when saving from it', async () => {
+    const result = await call('save_weather_summary', { watch_id: 'never-existed', title: 'Nope' });
+    assert.equal(result.isError, true);
+    assert.match(firstText(result), /list_weather_watches/);
+  });
+
+  it('lists saved datasets with the metadata needed to pick one', async () => {
+    const result = await call('list_weather_summaries', {});
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{
+      count: number;
+      total: number;
+      data_directory: string;
+      exports_directory: string;
+      generated_at: string;
+      datasets: Array<Record<string, unknown>>;
+    }>(result);
+
+    assert.ok(data.total >= 3, 'the datasets saved above should be listed');
+    assert.ok(Number.isFinite(Date.parse(data.generated_at)));
+    assert.match(data.data_directory, /summaries$/);
+    assert.match(data.exports_directory, /exports$/);
+
+    const target = data.datasets.find((entry) => entry['id'] === DATASET);
+    assert.ok(target !== undefined);
+    assert.equal(target['entry_count'], 2);
+    assert.equal(target['entries'], null, 'rows are excluded unless include_entries is set');
+    assert.equal(typeof target['file_path'], 'string');
+  });
+
+  it('explains how to find a dataset id that does not exist', async () => {
+    const result = await call('list_weather_summaries', { dataset_id: 'no-such-dataset' });
+    assert.equal(result.isError, true);
+    assert.match(firstText(result), /list_weather_summaries/);
+  });
+
+  it('documents every metric field in the generated input schema', async () => {
+    // The entry schema is written by hand for good field descriptions, so this
+    // catches a metric added to the shared table but forgotten in the schema.
+    const { tools } = await client.listTools();
+    const tool = tools.find((entry) => entry.name === 'save_weather_summary');
+    assert.ok(tool !== undefined);
+
+    const schema = tool.inputSchema as {
+      properties: Record<string, { items?: { properties?: Record<string, unknown> } }>;
+    };
+    const entryProperties = schema.properties['entries']?.items?.properties ?? {};
+
+    for (const key of METRIC_KEYS) {
+      assert.ok(key in entryProperties, `save_weather_summary.entries[].${key} is not documented`);
+    }
+  });
+});
+
+describe('Excel export', () => {
+  const DATASET = 'excel-check';
+
+  // Built here rather than reused from the suite above, so this one states its own
+  // input and cannot be broken by an unrelated test overwriting the dataset.
+  before(async () => {
+    const saved = await call('save_weather_summary', {
+      dataset_id: DATASET,
+      title: 'Excel check',
+      summary: 'Два города, один день.',
+      units: 'metric',
+      entries: [
+        {
+          location: 'Moscow',
+          date: '2026-09-25',
+          condition: 'Light rain',
+          temperature: 12.4,
+          temperature_min: 8.2,
+          temperature_max: 14.9,
+          precipitation: 1.23,
+          wind_gusts: 31.5,
+          extra: { aqi: 42, sunrise: '06:12' },
+        },
+        {
+          location: 'Sochi',
+          date: '2026-09-25',
+          condition: 'Clear sky',
+          temperature: 24.1,
+          temperature_min: 19.5,
+          temperature_max: 27.3,
+          precipitation: 0,
+          wind_gusts: 11.2,
+        },
+      ],
+    });
+    assert.notEqual(saved.isError, true, firstText(saved));
+  });
+
+  it('returns the workbook itself as an embedded resource', async () => {
+    const result = await call('export_weather_summary_excel', { dataset_id: DATASET });
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{
+      dataset_id: string;
+      file_name: string;
+      file_path: string;
+      file_uri: string;
+      bytes: number;
+      sha256: string;
+      mime_type: string;
+      rows: number;
+      columns: string[];
+      sheets: string[];
+      content_included: boolean;
+      content_omitted_reason: string | null;
+    }>(result);
+
+    assert.equal(data.dataset_id, DATASET);
+    assert.equal(data.file_name.startsWith(`${DATASET}-`), true);
+    assert.equal(data.mime_type, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    assert.deepEqual(data.sheets, ['Weather', 'Stats', 'Info']);
+    assert.equal(data.rows, 2);
+    assert.ok(data.columns.includes('temperature, °C'), 'units belong in the column header');
+    assert.ok(data.columns.includes('aqi'), 'extra metrics become their own columns');
+    assert.equal(data.columns.includes('precip_probability, %'), false, 'empty metrics get no column');
+    assert.match(data.file_uri, /^file:\/\/.+\.xlsx$/);
+
+    // The file must arrive in the result: over a remote HTTP transport the
+    // server's filesystem is not reachable from the caller.
+    const resource = result.content.find((block) => block.type === 'resource');
+    assert.ok(resource !== undefined, 'the result must carry the workbook as an embedded resource');
+    const embedded = resource as { resource: { uri: string; mimeType: string; blob: string } };
+    assert.equal(embedded.resource.uri, data.file_uri);
+    assert.equal(embedded.resource.mimeType, data.mime_type);
+
+    const received = Buffer.from(embedded.resource.blob, 'base64');
+    assert.equal(received.subarray(0, 2).toString('ascii'), 'PK', 'an xlsx is a ZIP archive');
+    assert.equal(received.length, data.bytes);
+    assert.equal(createHash('sha256').update(received).digest('hex'), data.sha256);
+
+    // The server keeps its own copy, byte for byte identical to the attachment.
+    assert.deepEqual(await readFile(data.file_path), received);
+    assert.equal(data.content_included, true);
+    assert.equal(data.content_omitted_reason, null);
+  });
+
+  it('writes the file without embedding it when asked', async () => {
+    const result = await call('export_weather_summary_excel', {
+      dataset_id: DATASET,
+      file_name: 'report',
+      include_file_content: false,
+    });
+
+    assert.notEqual(result.isError, true, firstText(result));
+    const data = structured<{ file_name: string; file_path: string; content_included: boolean; content_omitted_reason: string | null }>(result);
+
+    assert.match(data.file_name, /^excel-check-report(-\d+)?\.xlsx$/);
+    assert.equal(data.content_included, false);
+    assert.match(data.content_omitted_reason ?? '', /include_file_content/);
+    assert.equal(result.content.some((block) => block.type === 'resource'), false);
+
+    const onDisk = await readFile(data.file_path);
+    assert.equal(onDisk.subarray(0, 2).toString('ascii'), 'PK');
+  });
+
+  it('explains how to find the right dataset id', async () => {
+    const result = await call('export_weather_summary_excel', { dataset_id: 'missing-dataset' });
+    assert.equal(result.isError, true);
+    assert.match(firstText(result), /list_weather_summaries/);
+  });
+
+  it('is discoverable from the save reply alone', async () => {
+    // The workflow the agent is expected to follow: save, then export using the
+    // id from the save reply, without a separate lookup call.
+    const saved = await call('save_weather_summary', {
+      title: 'Workflow check',
+      entries: [{ location: 'Perm', date: '2026-09-25', temperature: -3.5, snowfall: 4 }],
+    });
+    const id = structured<{ dataset: { id: string } }>(saved).dataset.id;
+    assert.equal(id, 'workflow-check');
+
+    const exported = await call('export_weather_summary_excel', { dataset_id: id });
+    assert.notEqual(exported.isError, true, firstText(exported));
+    assert.equal(structured<{ dataset_id: string }>(exported).dataset_id, id);
   });
 });

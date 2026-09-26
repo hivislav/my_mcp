@@ -1,6 +1,7 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { mkdir, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Logger } from '../logger.js';
+import { atomicWriteJson, probeWritableDirectory, readJsonFile, WriteQueue } from '../storage/json-file.js';
 import { hasOffset, offsetForZone, qualifyTimestamp } from '../weather/time.js';
 import type { WatchDefinition, WatchSample, WatchStats } from './types.js';
 
@@ -12,9 +13,8 @@ import type { WatchDefinition, WatchSample, WatchStats } from './types.js';
  * the next call. The collector also has to survive a container restart, which
  * only a real volume gives us.
  *
- * Every write goes to a temporary file and is then renamed over the target.
- * `rename` is atomic within a filesystem, so a crash mid-write leaves the
- * previous good file intact instead of a truncated JSON document.
+ * Atomicity and write serialisation live in `src/storage/json-file.ts`, shared
+ * with the saved-summary store.
  */
 export class WatchStore {
   readonly #dataDir: string;
@@ -22,7 +22,7 @@ export class WatchStore {
   readonly #log: Logger;
 
   /** Serialises writes so the poller and tool handlers cannot interleave. */
-  #writeChain: Promise<unknown> = Promise.resolve();
+  readonly #writes = new WriteQueue();
 
   #writable: boolean | null = null;
 
@@ -52,19 +52,17 @@ export class WatchStore {
    * the first sample ten minutes later.
    */
   async ensureWritable(): Promise<{ ok: true } | { ok: false; reason: string }> {
-    try {
-      await mkdir(this.#samplesDir, { recursive: true });
-      const probe = join(this.#dataDir, '.write-probe');
-      await writeFile(probe, String(Date.now()), 'utf8');
-      await rm(probe, { force: true });
-      this.#writable = true;
-      return { ok: true };
-    } catch (error) {
-      this.#writable = false;
-      const reason = error instanceof Error ? `${(error as NodeJS.ErrnoException).code ?? ''} ${error.message}`.trim() : String(error);
-      this.#log.error('data directory is not writable', { dataDir: this.#dataDir, reason });
-      return { ok: false, reason };
+    const result = await probeWritableDirectory(this.#dataDir);
+    this.#writable = result.ok;
+    if (!result.ok) {
+      this.#log.error('data directory is not writable', { dataDir: this.#dataDir, reason: result.reason });
+      return result;
     }
+    // Created eagerly so an operator inspecting the volume sees the layout the
+    // documentation describes, rather than an empty directory until the first
+    // sample lands.
+    await mkdir(this.#samplesDir, { recursive: true });
+    return result;
   }
 
   get writable(): boolean {
@@ -72,7 +70,7 @@ export class WatchStore {
   }
 
   async loadRegistry(): Promise<{ watches: WatchDefinition[]; stats: Map<string, WatchStats> }> {
-    const raw = await this.#readJson<RegistryFile>(this.registryPath);
+    const raw = await readJsonFile<RegistryFile>(this.registryPath, this.#log);
     if (raw === null || !Array.isArray(raw.watches)) {
       return { watches: [], stats: new Map() };
     }
@@ -100,11 +98,11 @@ export class WatchStore {
       updated_at: new Date().toISOString(),
       watches: watches.map((definition) => ({ ...definition, stats: stats.get(definition.id) })),
     };
-    await this.#atomicWrite(this.registryPath, payload);
+    await atomicWriteJson(this.registryPath, payload, this.#writes);
   }
 
   async loadSamples(watchId: string): Promise<WatchSample[]> {
-    const raw = await this.#readJson<SamplesFile>(this.samplePath(watchId));
+    const raw = await readJsonFile<SamplesFile>(this.samplePath(watchId), this.#log);
     if (raw === null || !Array.isArray(raw.samples)) return [];
     return raw.samples.filter(isUsableSample).map(qualifySampleTimestamp);
   }
@@ -122,18 +120,22 @@ export class WatchStore {
     let repaired = 0;
     for (const watchId of watchIds) {
       const path = this.samplePath(watchId);
-      const raw = await this.#readJson<SamplesFile>(path);
+      const raw = await readJsonFile<SamplesFile>(path, this.#log);
       if (raw === null || !Array.isArray(raw.samples)) continue;
 
       const original = raw.samples.filter(isUsableSample);
       const normalised = original.map(qualifySampleTimestamp);
       if (original.every((sample, index) => sample.observed_at === normalised[index]?.observed_at)) continue;
 
-      await this.#atomicWrite(path, {
-        ...raw,
-        updated_at: new Date().toISOString(),
-        samples: normalised,
-      });
+      await atomicWriteJson(
+        path,
+        {
+          ...raw,
+          updated_at: new Date().toISOString(),
+          samples: normalised,
+        },
+        this.#writes,
+      );
       repaired += 1;
     }
     if (repaired > 0) this.#log.info('repaired timestamps in stored samples', { files: repaired });
@@ -177,7 +179,7 @@ export class WatchStore {
       sample_count: kept.length,
       samples: kept,
     };
-    await this.#atomicWrite(path, payload);
+    await atomicWriteJson(path, payload, this.#writes);
 
     const pruned = merged.length - kept.length;
     if (pruned > 0) {
@@ -187,50 +189,13 @@ export class WatchStore {
   }
 
   async removeWatch(watchId: string): Promise<void> {
-    await this.#enqueue(async () => {
+    // Queued like every other mutation, so a collection cycle in flight cannot
+    // recreate the file this call is deleting.
+    await this.#writes.enqueue(async () => {
       await rm(this.samplePath(watchId), { force: true });
     });
   }
-
-  async #readJson<T>(path: string): Promise<T | null> {
-    try {
-      const text = await readFile(path, 'utf8');
-      return JSON.parse(text) as T;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') return null;
-      // A corrupt file must not take the server down: report it and start clean
-      // rather than throwing out of a tool call.
-      this.#log.error('could not read JSON state file', {
-        path,
-        reason: error instanceof Error ? error.message : String(error),
-      });
-      return null;
-    }
-  }
-
-  #atomicWrite(path: string, payload: unknown): Promise<void> {
-    return this.#enqueue(async () => {
-      await mkdir(dirname(path), { recursive: true });
-      const temporary = `${path}.${process.pid}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-      await rename(temporary, path);
-    });
-  }
-
-  /** Chains an operation onto the write queue so writes never interleave. */
-  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.#writeChain.then(operation, operation);
-    // Keep the chain alive even if this operation rejects.
-    this.#writeChain = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
-}
-
-interface RegistryFile {
+}interface RegistryFile {
   version: number;
   updated_at: string;
   watches: Array<WatchDefinition & { stats?: WatchStats | undefined }>;
