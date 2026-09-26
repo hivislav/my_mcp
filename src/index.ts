@@ -32,6 +32,11 @@ Environment:
   OPEN_METEO_API_KEY                   Optional key for a commercial Open-Meteo plan
   OPEN_METEO_TIMEOUT_MS                Per-request timeout (default 15000)
   OPEN_METEO_MAX_RETRIES               Retries for transient failures (default 2)
+  WATCH_ENABLED                        Run the periodic collector (default true)
+  WATCH_INTERVAL_SECONDS               Seconds between collections (default 900 = 15 min)
+  WATCH_RETENTION_HOURS                How long samples are kept (default 168 = 7 days)
+  WATCH_DATA_DIR                       Where watches.json and samples/ live (default ./data)
+  WATCH_MAX_WATCHES                    Maximum concurrent watches (default 20)
   LOG_LEVEL                            debug | info | warn | error | silent
 
 See .env.example and README.md for details.
@@ -52,6 +57,17 @@ async function main(): Promise<void> {
   const logger = createLogger(config.logLevel, { server: SERVER_NAME, version: SERVER_VERSION });
   const deps = buildDeps(config, logger);
 
+  // Start the collector once, here in the entry point — never inside
+  // createServer(). Stateless MCP builds a fresh server per HTTP request, so a
+  // timer started there would be recreated on every call and never fire on
+  // schedule. Starting it before the transport also guarantees that the first
+  // tool call already sees the persisted registry.
+  if (config.watch.enabled) {
+    await deps.watches.start();
+  } else {
+    logger.info('weather watcher disabled by configuration (WATCH_ENABLED=false)');
+  }
+
   if (config.transport === 'stdio') {
     await runStdio(config, deps, logger);
   } else {
@@ -71,7 +87,12 @@ async function runStdio(config: Config, deps: ReturnType<typeof buildDeps>, logg
 
   const shutdown = () => {
     logger.info('shutting down stdio transport');
-    void server.close().finally(() => process.exit(0));
+    void deps.watches
+      .stop()
+      .catch(() => undefined)
+      .finally(() => {
+        void server.close().finally(() => process.exit(0));
+      });
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
@@ -102,6 +123,7 @@ async function runHttp(config: Config, deps: ReturnType<typeof buildDeps>, logge
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info('shutting down http transport', { signal });
+    void deps.watches.stop().catch(() => undefined);
     void handle
       .close()
       .catch((error: unknown) => {

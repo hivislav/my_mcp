@@ -2,10 +2,12 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { ForecastResponse } from '../open-meteo/types.js';
 import type { ToolDeps } from './deps.js';
-import { num, str } from './coerce.js';
+import { num, str } from '../weather/coerce.js';
 import { formatLines, guard, toolResult } from './result.js';
 import { locationInputShape, locationOutputShape, locationPayload, placeLabel } from './schemas.js';
-import { assertNoUpstreamError, resolveLocation, round } from './shared.js';
+import { resolveLocation } from './shared.js';
+import { assertNoUpstreamError } from '../weather/snapshot.js';
+import { round } from '../weather/coerce.js';
 
 const AIR_QUALITY_VARIABLES = [
   'pm10',

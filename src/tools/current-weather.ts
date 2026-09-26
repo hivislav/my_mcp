@@ -1,31 +1,11 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { ForecastResponse } from '../open-meteo/types.js';
-import { decodeWeatherCode } from '../open-meteo/weather-codes.js';
 import type { ToolDeps } from './deps.js';
-import { bool, num, str } from './coerce.js';
-import { formatLines, guard, toolResult, unitsFor, upstreamParamsFor } from './result.js';
+import { formatLines, guard, toolResult } from './result.js';
+import { unitsFor } from '../weather/units.js';
+import { fetchWeatherSnapshot } from '../weather/snapshot.js';
 import { locationInputShape, locationOutputShape, locationPayload, placeLabel } from './schemas.js';
-import { assertNoUpstreamError, forecastTarget, resolveLocation, round } from './shared.js';
-
-/** Current conditions offered by the free forecast endpoint. */
-const CURRENT_VARIABLES = [
-  'temperature_2m',
-  'relative_humidity_2m',
-  'apparent_temperature',
-  'is_day',
-  'precipitation',
-  'rain',
-  'showers',
-  'snowfall',
-  'weather_code',
-  'cloud_cover',
-  'pressure_msl',
-  'surface_pressure',
-  'wind_speed_10m',
-  'wind_direction_10m',
-  'wind_gusts_10m',
-] as const;
+import { resolveLocation } from './shared.js';
 
 export function registerCurrentWeatherTool(server: McpServer, deps: ToolDeps): void {
   server.registerTool(
@@ -91,46 +71,20 @@ export function registerCurrentWeatherTool(server: McpServer, deps: ToolDeps): v
             { defaultLanguage: language },
           );
 
-          const target = forecastTarget(deps.config);
-          const payload = await deps.clients.forecast.getJson<ForecastResponse>(target.path, {
-            latitude: resolved.latitude,
-            longitude: resolved.longitude,
-            current: [...CURRENT_VARIABLES],
-            timezone: 'auto',
-            models: target.models,
-            ...upstreamParamsFor(units),
-          });
-          assertNoUpstreamError(payload, 'Current weather request was rejected');
+          const snapshot = await fetchWeatherSnapshot(
+            { clients: deps.clients, config: deps.config },
+            { latitude: resolved.latitude, longitude: resolved.longitude, timezone: resolved.timezone },
+            units,
+          );
 
-          const current = payload.current ?? {};
-          const code = num(current['weather_code']);
-          const condition = decodeWeatherCode(code);
+          const { condition, condition_en: conditionEn, condition_ru: conditionRu } = snapshot;
+          const code = snapshot.weather_code;
           const unitSet = unitsFor(units);
-          const timezone = payload.timezone ?? resolved.timezone ?? null;
+          const timezone = snapshot.timezone;
 
           const structured = {
             location: { ...locationPayload(resolved), timezone },
-            observed_at: str(current['time']) ?? '',
-            timezone,
-            utc_offset_seconds: payload.utc_offset_seconds ?? null,
-            is_day: bool(current['is_day']),
-            weather_code: code,
-            condition: condition.condition,
-            condition_en: condition.en,
-            condition_ru: condition.ru,
-            temperature: round(num(current['temperature_2m'])),
-            apparent_temperature: round(num(current['apparent_temperature'])),
-            relative_humidity: round(num(current['relative_humidity_2m']), 0),
-            precipitation: round(num(current['precipitation']), 2),
-            rain: round(num(current['rain']), 2),
-            showers: round(num(current['showers']), 2),
-            snowfall: round(num(current['snowfall']), 2),
-            cloud_cover: round(num(current['cloud_cover']), 0),
-            pressure_msl: round(num(current['pressure_msl'])),
-            surface_pressure: round(num(current['surface_pressure'])),
-            wind_speed: round(num(current['wind_speed_10m'])),
-            wind_direction: round(num(current['wind_direction_10m']), 0),
-            wind_gusts: round(num(current['wind_gusts_10m'])),
+            ...snapshot,
             units: unitSet,
           };
 
@@ -138,7 +92,7 @@ export function registerCurrentWeatherTool(server: McpServer, deps: ToolDeps): v
             `Current weather in ${placeLabel(resolved)} (${resolved.latitude}, ${resolved.longitude})`,
             formatLines([
               ['observed at', `${structured.observed_at}${timezone !== null ? ` (${timezone})` : ''}`],
-              ['condition', `${condition.en} / ${condition.ru} (WMO ${code ?? 'n/a'})`],
+              ['condition', `${conditionEn} / ${conditionRu} (WMO ${code ?? 'n/a'})`],
               ['daylight', structured.is_day === null ? null : structured.is_day ? 'day' : 'night'],
               [
                 'temperature',

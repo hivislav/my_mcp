@@ -3,10 +3,13 @@ import { z } from 'zod';
 import type { ForecastResponse } from '../open-meteo/types.js';
 import { decodeWeatherCode } from '../open-meteo/weather-codes.js';
 import type { ToolDeps } from './deps.js';
-import { num, series, str } from './coerce.js';
-import { formatLines, guard, toolResult, unitsFor, upstreamParamsFor } from './result.js';
+import { num, series, str } from '../weather/coerce.js';
+import { formatLines, guard, toolResult } from './result.js';
+import { unitsFor, upstreamParamsFor } from '../weather/units.js';
 import { locationInputShape, locationOutputShape, locationPayload, placeLabel } from './schemas.js';
-import { assertNoUpstreamError, forecastTarget, resolveLocation, round } from './shared.js';
+import { resolveLocation } from './shared.js';
+import { assertNoUpstreamError, forecastTarget } from '../weather/snapshot.js';
+import { round } from '../weather/coerce.js';
 
 const DAILY_VARIABLES = [
   'weather_code',

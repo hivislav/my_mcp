@@ -1,23 +1,6 @@
 import type { Clients } from '../open-meteo/client.js';
-import { InvalidInputError, OpenMeteoError } from '../open-meteo/errors.js';
+import { InvalidInputError } from '../open-meteo/errors.js';
 import type { GeoResult } from '../open-meteo/types.js';
-import type { ToolDeps } from './deps.js';
-
-/**
- * Resolves the forecast endpoint from configuration.
- *
- * The path and the `models` parameter travel together: the standard forecast
- * host wants `/v1/forecast` and takes no `models`, while the ensemble host wants
- * `/v1/ensemble` and rejects the default `best_match` unless a model is named.
- * Keeping them in one place stops the two tools from drifting apart.
- */
-export function forecastTarget(config: ToolDeps['config']): { path: string; models: string | undefined } {
-  const models = config.openMeteo.models.trim();
-  return {
-    path: config.openMeteo.forecastPath,
-    models: models === '' ? undefined : models,
-  };
-}
 
 export interface ResolvedLocation {
   name: string;
@@ -159,7 +142,7 @@ export async function searchPlaces(
   );
 }
 
-/** Human-readable "City, Region, Country" label used in text output. */
+/** Bounds-checks a coordinate before it reaches the upstream API. */
 export function assertRange(value: number, min: number, max: number, label: string): void {
   if (!Number.isFinite(value)) {
     throw new InvalidInputError(`\`${label}\` must be a finite number, got ${String(value)}.`);
@@ -172,24 +155,3 @@ export function assertRange(value: number, min: number, max: number, label: stri
 export function formatCoord(value: number): string {
   return value.toFixed(4);
 }
-
-/**
- * Open-Meteo normally signals problems with a 4xx status, which the client
- * already classifies. It can also return HTTP 200 with `{"error": true}`, so
- * every tool checks for that rather than trusting the status code alone.
- */
-export function assertNoUpstreamError(payload: { error?: boolean; reason?: string }, context: string): void {
-  if (payload.error === true) {
-    throw new OpenMeteoError('invalid_request', `${context}: ${payload.reason ?? 'upstream reported an error'}`, {
-      retryable: false,
-    });
-  }
-}
-
-export function round(value: number | null | undefined, digits = 1): number | null {
-  if (value === null || value === undefined || !Number.isFinite(value)) return null;
-  const factor = 10 ** digits;
-  return Math.round(value * factor) / factor;
-}
-
-export { OpenMeteoError };

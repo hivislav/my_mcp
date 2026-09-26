@@ -5,8 +5,8 @@ import { createLogger } from '../src/logger.js';
 import { OpenMeteoClient } from '../src/open-meteo/client.js';
 import { OpenMeteoError } from '../src/open-meteo/errors.js';
 import { decodeWeatherCode } from '../src/open-meteo/weather-codes.js';
-import { bool, num, series, str } from '../src/tools/coerce.js';
-import { forecastTarget } from '../src/tools/shared.js';
+import { bool, num, series, str } from '../src/weather/coerce.js';
+import { forecastTarget } from '../src/weather/snapshot.js';
 
 const TOUCHED = [
   'MCP_TRANSPORT',
@@ -25,6 +25,11 @@ const TOUCHED = [
   'OPEN_METEO_FORECAST_PATH',
   'OPEN_METEO_MODELS',
   'OPEN_METEO_API_KEY',
+  'WATCH_ENABLED',
+  'WATCH_INTERVAL_SECONDS',
+  'WATCH_RETENTION_HOURS',
+  'WATCH_DATA_DIR',
+  'WATCH_MAX_WATCHES',
   'LOG_LEVEL',
 ] as const;
 
@@ -165,6 +170,43 @@ describe('configuration', () => {
     const target = forecastTarget(loadConfig([]));
     assert.equal(target.path, '/v1/forecast');
     assert.equal(target.models, undefined);
+  });
+
+  it('defaults the weather collector to a 15 minute interval and 7 day retention', () => {
+    clearEnv();
+    const config = loadConfig([]);
+    assert.equal(config.watch.enabled, true);
+    assert.equal(config.watch.intervalSeconds, 900);
+    assert.equal(config.watch.retentionHours, 168);
+    assert.equal(config.watch.dataDir, './data');
+    assert.equal(config.watch.maxWatches, 20);
+  });
+
+  it('reads collector settings from the environment', () => {
+    clearEnv();
+    process.env['WATCH_ENABLED'] = 'false';
+    process.env['WATCH_INTERVAL_SECONDS'] = '60';
+    process.env['WATCH_RETENTION_HOURS'] = '24';
+    process.env['WATCH_DATA_DIR'] = '/var/lib/open-meteo-mcp';
+    process.env['WATCH_MAX_WATCHES'] = '3';
+
+    const config = loadConfig([]);
+    assert.equal(config.watch.enabled, false);
+    assert.equal(config.watch.intervalSeconds, 60);
+    assert.equal(config.watch.retentionHours, 24);
+    assert.equal(config.watch.dataDir, '/var/lib/open-meteo-mcp');
+    assert.equal(config.watch.maxWatches, 3);
+  });
+
+  it('rejects a collection interval below the safety floor', () => {
+    // Anything under 30 s would hammer the free tier's minutely request limit.
+    clearEnv();
+    process.env['WATCH_INTERVAL_SECONDS'] = '1';
+    assert.throws(() => loadConfig([]), /WATCH_INTERVAL_SECONDS must be between 30 and 86400/);
+
+    clearEnv();
+    process.env['WATCH_INTERVAL_SECONDS'] = 'not-a-number';
+    assert.throws(() => loadConfig([]), /must be an integer/);
   });
 
   it('treats a whitespace-only model list as absent', () => {

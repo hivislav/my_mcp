@@ -20,6 +20,9 @@ deploy/*.local.yml
 # Host keys captured while deploying (if pointed inside the repo)
 .ssh-known-hosts
 
+# Collected weather history (contains real location data, and is rebuilt at runtime)
+data/
+
 # Local npm cache used when the global cache is unusable
 .npm-cache/
 

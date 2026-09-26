@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -6,6 +9,9 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { Config } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
 import { buildDeps, createServer } from '../src/server.js';
+import type { ToolDeps } from '../src/tools/deps.js';
+import { WatchService } from '../src/watch/service.js';
+import { WatchStore } from '../src/watch/store.js';
 import { TOOL_NAMES } from '../src/tools/index.js';
 import { startMockUpstream, type MockUpstream } from './mock-upstream.js';
 
@@ -20,8 +26,15 @@ import { startMockUpstream, type MockUpstream } from './mock-upstream.js';
 let upstream: MockUpstream;
 let client: Client;
 let server: ReturnType<typeof createServer>;
+let deps: ToolDeps;
+let watchDataDir: string;
 
-function makeConfig(baseUrl: string, overrides: Partial<Config['openMeteo']> = {}): Config {
+function makeConfig(
+  baseUrl: string,
+  watchDataDir: string,
+  overrides: Partial<Config['openMeteo']> = {},
+  watchOverrides: Partial<Config['watch']> = {},
+): Config {
   return {
     transport: 'stdio',
     http: {
@@ -48,13 +61,26 @@ function makeConfig(baseUrl: string, overrides: Partial<Config['openMeteo']> = {
       userAgent: 'open-meteo-mcp-test/1.0.0',
       ...overrides,
     },
+    watch: {
+      enabled: true,
+      intervalSeconds: 900,
+      retentionHours: 168,
+      dataDir: watchDataDir,
+      maxWatches: 20,
+      ...watchOverrides,
+    },
     logLevel: 'silent',
   };
 }
 
 /** Boots an isolated client/server pair so a test can vary the configuration. */
 async function connectWith(config: Config): Promise<{ client: Client; close: () => Promise<void> }> {
-  const server = createServer(buildDeps(config, createLogger('silent')));
+  const isolatedDeps = buildDeps(config, createLogger('silent'));
+  // Load persisted state but do NOT start the timer: the startup poll would add a
+  // fresh sample and change what a windowed report sees.
+  await isolatedDeps.watches.initialise();
+
+  const server = createServer(isolatedDeps);
   const isolated = new Client({ name: 'test-client-isolated', version: '1.0.0' }, { capabilities: {} });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([isolated.connect(clientTransport), server.connect(serverTransport)]);
@@ -68,11 +94,19 @@ async function connectWith(config: Config): Promise<{ client: Client; close: () 
 }
 
 before(async () => {
+  // A real temp directory: the watcher persists to disk, and tests must not write
+  // into the repository or share state between runs.
+  watchDataDir = await mkdtemp(join(tmpdir(), 'open-meteo-mcp-test-'));
   upstream = await startMockUpstream();
-  const config = makeConfig(upstream.url);
+  const config = makeConfig(upstream.url, watchDataDir);
   const logger = createLogger('silent');
 
-  server = createServer(buildDeps(config, logger));
+  deps = buildDeps(config, logger);
+  // Start the collector so its tools are usable, but the poller never fires: the
+  // configured interval is 900 s and tests drive collection explicitly.
+  await deps.watches.start();
+
+  server = createServer(deps);
   client = new Client({ name: 'test-client', version: '1.0.0' }, { capabilities: {} });
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -80,9 +114,11 @@ before(async () => {
 });
 
 after(async () => {
+  await deps.watches.stop();
   await client.close();
   await server.close();
   await upstream.close();
+  await rm(watchDataDir, { recursive: true, force: true });
 });
 
 async function call(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
@@ -101,7 +137,7 @@ function firstText(result: CallToolResult): string {
 }
 
 describe('tool registration and parameter descriptions', () => {
-  it('registers exactly the four documented tools', async () => {
+  it('registers exactly the documented tools', async () => {
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
@@ -126,8 +162,9 @@ describe('tool registration and parameter descriptions', () => {
       const schema = tool.inputSchema as { type?: string; properties?: Record<string, { description?: string }> };
       assert.equal(schema.type, 'object', `${tool.name}: input schema must be an object`);
       const properties = schema.properties ?? {};
-      assert.ok(Object.keys(properties).length > 0, `${tool.name}: no input parameters declared`);
 
+      // A zero-argument tool such as list_weather_watches is legitimate, but when
+      // parameters do exist every one of them must carry a usable description.
       for (const [param, definition] of Object.entries(properties)) {
         assert.ok(
           typeof definition.description === 'string' && definition.description.trim().length > 10,
@@ -138,11 +175,42 @@ describe('tool registration and parameter descriptions', () => {
     }
   });
 
-  it('marks every tool as read-only and non-destructive', async () => {
+  it('declares coherent annotations, including for state-changing tools', async () => {
     const { tools } = await client.listTools();
+    const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
     for (const tool of tools) {
-      assert.equal(tool.annotations?.readOnlyHint, true, `${tool.name}: readOnlyHint`);
-      assert.equal(tool.annotations?.destructiveHint, false, `${tool.name}: destructiveHint`);
+      assert.notEqual(tool.annotations?.readOnlyHint, undefined, `${tool.name}: readOnlyHint must be declared`);
+      assert.notEqual(tool.annotations?.destructiveHint, undefined, `${tool.name}: destructiveHint must be declared`);
+      // Nothing may claim to be read-only and destructive at the same time.
+      assert.ok(
+        !(tool.annotations?.readOnlyHint === true && tool.annotations?.destructiveHint === true),
+        `${tool.name}: cannot be both read-only and destructive`,
+      );
+    }
+
+    // The collection tools genuinely change server state, so they must not be
+    // advertised as read-only — that would licence an agent to call them freely,
+    // and stop_weather_watch deletes history.
+    assert.equal(byName.get('start_weather_watch')?.annotations?.readOnlyHint, false);
+    assert.equal(byName.get('stop_weather_watch')?.annotations?.readOnlyHint, false);
+    // Pausing keeps every sample, so it must NOT be flagged destructive — an
+    // agent that saw destructiveHint would hesitate or ask for confirmation.
+    assert.equal(byName.get('stop_weather_watch')?.annotations?.destructiveHint, false);
+    // Actually deleting history is destructive.
+    assert.equal(byName.get('delete_weather_watch')?.annotations?.readOnlyHint, false);
+    assert.equal(byName.get('delete_weather_watch')?.annotations?.destructiveHint, true);
+
+    for (const name of [
+      'geocode_location',
+      'get_current_weather',
+      'get_weather_forecast',
+      'get_air_quality',
+      'list_weather_watches',
+      'get_weather_watch_report',
+    ]) {
+      assert.equal(byName.get(name)?.annotations?.readOnlyHint, true, `${name} should be read-only`);
+      assert.equal(byName.get(name)?.annotations?.destructiveHint, false, `${name} should be non-destructive`);
     }
   });
 });
@@ -365,7 +433,7 @@ describe('switching the forecast backend (the VPS configuration)', () => {
     // also restores precipitation probability that the ensemble host lacks.
     upstream.requests.length = 0;
     const session = await connectWith(
-      makeConfig(upstream.url, {
+      makeConfig(upstream.url, watchDataDir, {
         forecastPath: '/v1/forecast',
         models: '',
       }),
@@ -409,5 +477,582 @@ describe('result shape contract', () => {
       assert.equal(typeof result.structuredContent, 'object', `${name}: structuredContent must be an object`);
       assert.ok(!Array.isArray(result.structuredContent), `${name}: structuredContent must not be an array`);
     }
+  });
+});
+
+describe('periodic weather watches', () => {
+  it('registers a watch, derives an id and collects the first sample immediately', async () => {
+    const result = await call('start_weather_watch', { location: 'Paris', language: 'en' });
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{
+      watch: Record<string, unknown>;
+      replaced_existing: boolean;
+      interval_seconds: number;
+      first_sample_status: string;
+    }>(result);
+
+    assert.equal(data.watch['id'], 'paris', 'id should be derived from the place label');
+    assert.equal(data.watch['resolved_from'], 'Paris');
+    assert.equal(data.interval_seconds, 900);
+    assert.equal(data.replaced_existing, false);
+    // The first sample is awaited, so the caller can report on real data at once.
+    assert.match(data.first_sample_status, /collected/);
+  });
+
+  it('accepts an explicit id and raw coordinates', async () => {
+    const result = await call('start_weather_watch', {
+      id: 'spb-center',
+      latitude: 59.9386,
+      longitude: 30.3141,
+      units: 'imperial',
+      language: 'ru',
+    });
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{ watch: Record<string, unknown> }>(result);
+    assert.equal(data.watch['id'], 'spb-center');
+    assert.equal(data.watch['resolved_from'], null, 'coordinates should not be geocoded');
+    assert.equal(data.watch['units'], 'imperial');
+  });
+
+  it('lists watches with collection health', async () => {
+    const result = await call('list_weather_watches', {});
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{
+      count: number;
+      interval_seconds: number;
+      data_directory: string;
+      watches: Array<Record<string, unknown>>;
+    }>(result);
+
+    assert.ok(data.count >= 2, 'the two watches registered above should be listed');
+    assert.equal(data.interval_seconds, 900);
+    assert.equal(data.data_directory, watchDataDir);
+
+    const paris = data.watches.find((entry) => (entry['definition'] as Record<string, unknown>)['id'] === 'paris');
+    assert.ok(paris !== undefined);
+    assert.equal(paris['healthy'], true);
+    assert.ok((paris['sample_count'] as number) >= 1);
+    assert.equal(typeof paris['staleness_minutes'], 'number');
+  });
+
+  it('aggregates a report over the collected samples', async () => {
+    const result = await call('get_weather_watch_report', { id: 'paris', window_hours: 24 });
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{
+      aggregate: Record<string, unknown>;
+      stored_samples: number;
+      samples: unknown[];
+    }>(result);
+    const agg = data.aggregate as Record<string, any>;
+
+    assert.ok(data.stored_samples >= 1);
+    assert.equal(agg['window_hours'], 24);
+    assert.ok(agg['sample_count'] >= 1);
+    assert.ok(
+      typeof agg['observed_span_minutes'] === 'number',
+      'the report must state the period the samples span',
+    );
+    assert.equal('coverage_percent' in agg, false, 'no coverage quota may be exposed');
+    assert.equal(agg['temperature']['min'], 12.4, 'the mock reports 12.4 °C');
+    assert.equal(agg['apparent_temperature']['min'], 10.9, 'the mock reports 10.9 °C feels-like');
+    assert.equal(agg['dominant_condition']['condition'], 'slight_rain');
+    assert.equal(agg['dominant_condition']['share_percent'], 100);
+    assert.equal(agg['samples_with_precipitation'], 1);
+
+    // Raw samples stay out unless explicitly requested.
+    assert.deepEqual(data.samples, []);
+  });
+
+  it('includes raw samples only when asked', async () => {
+    const result = await call('get_weather_watch_report', { id: 'paris', include_samples: true });
+    const data = structured<{ samples: Array<Record<string, unknown>> }>(result);
+    assert.ok(data.samples.length >= 1);
+    assert.equal(typeof data.samples[0]?.['at'], 'string');
+    assert.equal(typeof data.samples[0]?.['observed_at'], 'string');
+    assert.equal(data.samples[0]?.['condition'], 'slight_rain');
+  });
+
+  it('explains how to recover from an unknown watch id', async () => {
+    const result = await call('get_weather_watch_report', { id: 'does-not-exist' });
+    assert.equal(result.isError, true);
+    const text = firstText(result);
+    assert.match(text, /does-not-exist/);
+    assert.match(text, /list_weather_watches/);
+  });
+
+  it('rejects an id that could not be used as a filename', async () => {
+    const result = await call('start_weather_watch', { id: '../escape', location: 'Paris' });
+    assert.equal(result.isError, true);
+  });
+
+  it('replaces a watch when the same id is reused', async () => {
+    const first = await call('start_weather_watch', { id: 'repeat', location: 'Paris' });
+    assert.equal(structured<{ replaced_existing: boolean }>(first).replaced_existing, false);
+
+    const second = await call('start_weather_watch', { id: 'repeat', location: 'London', countryCode: 'GB' });
+    assert.notEqual(second.isError, true, firstText(second));
+    assert.equal(structured<{ replaced_existing: boolean }>(second).replaced_existing, true);
+    assert.equal(structured<{ watch: Record<string, unknown> }>(second).watch['resolved_from'], 'London');
+  });
+
+  it('pausing stops collection but keeps the history, and resuming continues it', async () => {
+    await call('start_weather_watch', { id: 'pausable', location: 'Paris' });
+
+    const paused = await call('stop_weather_watch', { id: 'pausable' });
+    assert.notEqual(paused.isError, true, firstText(paused));
+    const pauseData = structured<{
+      found: boolean;
+      already_stopped: boolean;
+      stored_samples: number;
+    }>(paused);
+    assert.equal(pauseData.found, true);
+    assert.equal(pauseData.already_stopped, false);
+    assert.ok(pauseData.stored_samples >= 1, 'pausing must not delete samples');
+    assert.match(firstText(paused), /kept/i);
+
+    // The history is still readable after pausing.
+    const report = await call('get_weather_watch_report', { id: 'pausable' });
+    assert.notEqual(report.isError, true, firstText(report));
+    assert.ok(structured<{ stored_samples: number }>(report).stored_samples >= 1);
+    assert.match(firstText(report), /PAUSED/, 'the report must say the watch is paused');
+
+    // It is no longer polled.
+    const listed = await call('list_weather_watches', {});
+    const entry = structured<{ watches: Array<Record<string, unknown>> }>(listed).watches.find(
+      (w) => (w['definition'] as Record<string, unknown>)['id'] === 'pausable',
+    );
+    assert.equal(entry?.['enabled'], false);
+
+    // Pausing twice is not an error and still keeps the data.
+    const again = await call('stop_weather_watch', { id: 'pausable' });
+    assert.notEqual(again.isError, true);
+    assert.equal(structured<{ already_stopped: boolean }>(again).already_stopped, true);
+    assert.ok(structured<{ stored_samples: number }>(again).stored_samples >= 1);
+
+    // Resuming re-enables collection and preserves the accumulated samples.
+    const before = structured<{ stored_samples: number }>(
+      await call('get_weather_watch_report', { id: 'pausable' }),
+    ).stored_samples;
+
+    const resumed = await call('start_weather_watch', { id: 'pausable', location: 'Paris' });
+    assert.notEqual(resumed.isError, true, firstText(resumed));
+    const after = structured<{ stored_samples: number }>(
+      await call('get_weather_watch_report', { id: 'pausable' }),
+    ).stored_samples;
+    assert.ok(after > before, 'resuming must add a sample to the existing history');
+  });
+
+  it('reports clearly when pausing an unknown watch', async () => {
+    const result = await call('stop_weather_watch', { id: 'never-existed' });
+    assert.notEqual(result.isError, true, firstText(result));
+    const data = structured<{ found: boolean }>(result);
+    assert.equal(data.found, false);
+    assert.match(firstText(result), /list_weather_watches/);
+  });
+
+  it('deletes a watch and its history only when explicitly confirmed', async () => {
+    await call('start_weather_watch', { id: 'doomed', location: 'Paris' });
+
+    // The confirm flag is a deliberate speed bump; omitting it must be refused.
+    const unconfirmed = await call('delete_weather_watch', { id: 'doomed' });
+    assert.equal(unconfirmed.isError, true);
+    assert.match(firstText(unconfirmed), /confirm/i);
+
+    // The watch survives a refused deletion.
+    assert.notEqual((await call('get_weather_watch_report', { id: 'doomed' })).isError, true);
+
+    const deleted = await call('delete_weather_watch', { id: 'doomed', confirm: true });
+    assert.notEqual(deleted.isError, true, firstText(deleted));
+    const data = structured<{ deleted: boolean; deleted_samples: number }>(deleted);
+    assert.equal(data.deleted, true);
+    assert.ok(data.deleted_samples >= 1, 'the response should say how much history was destroyed');
+
+    // History is gone, so a report can no longer be produced.
+    assert.equal((await call('get_weather_watch_report', { id: 'doomed' })).isError, true);
+  });
+
+  it('reports nothing deleted for an unknown id', async () => {
+    const result = await call('delete_weather_watch', { id: 'never-existed', confirm: true });
+    assert.notEqual(result.isError, true, firstText(result));
+    assert.equal(structured<{ deleted: boolean }>(result).deleted, false);
+  });
+
+  it('persists watches and samples across a restart of the collector', async () => {
+    await call('start_weather_watch', { id: 'survivor', location: 'Paris' });
+
+    // A second service instance on the same directory models a container restart:
+    // in-memory state is gone, only the JSON on disk remains.
+    const restarted = new WatchService({
+      config: makeConfig(upstream.url, watchDataDir),
+      source: { clients: deps.clients, config: makeConfig(upstream.url, watchDataDir) },
+      logger: createLogger('silent'),
+    });
+    await restarted.start();
+    try {
+      assert.equal(restarted.has('survivor'), true, 'the watch registry must survive a restart');
+
+      const report = restarted.report('survivor', 24, true);
+      assert.ok(report !== null);
+      assert.ok(report.stored_samples >= 1, 'stored samples must survive a restart');
+      assert.equal(report.samples[0]?.['condition'], 'slight_rain');
+    } finally {
+      await restarted.stop();
+    }
+  });
+
+  it('enforces the configured watch limit', async () => {
+    // Its own directory: the registry is persisted, so watches created by other
+    // tests would otherwise already be at the limit before this one starts.
+    const limitDir = await mkdtemp(join(tmpdir(), 'open-meteo-mcp-limit-'));
+    const limited = await connectWith(makeConfig(upstream.url, limitDir, {}, { maxWatches: 1 }));
+    try {
+      const first = (await limited.client.callTool({
+        name: 'start_weather_watch',
+        arguments: { id: 'only-one', location: 'Paris' },
+      })) as CallToolResult;
+      assert.notEqual(first.isError, true, firstText(first));
+
+      const second = (await limited.client.callTool({
+        name: 'start_weather_watch',
+        arguments: { id: 'one-too-many', location: 'Paris' },
+      })) as CallToolResult;
+      assert.equal(second.isError, true);
+      assert.match(firstText(second), /limit/i);
+
+      // Replacing the existing watch is still allowed at the limit.
+      const replace = (await limited.client.callTool({
+        name: 'start_weather_watch',
+        arguments: { id: 'only-one', location: 'Paris' },
+      })) as CallToolResult;
+      assert.notEqual(replace.isError, true, firstText(replace));
+    } finally {
+      await limited.close();
+      await rm(limitDir, { recursive: true, force: true });
+    }
+  });
+
+  it('disables the watch tools with an actionable message when storage is unusable', async () => {
+    // A path under a regular file can never be created, which is how a read-only
+    // container without a mounted volume behaves.
+    const blocker = join(watchDataDir, 'blocker');
+    await writeFile(blocker, 'x', 'utf8');
+
+    const broken = await connectWith(makeConfig(upstream.url, join(blocker, 'data')));
+    try {
+      const result = (await broken.client.callTool({
+        name: 'start_weather_watch',
+        arguments: { location: 'Paris' },
+      })) as CallToolResult;
+
+      assert.equal(result.isError, true);
+      const text = firstText(result);
+      assert.match(text, /not writable/i);
+      assert.match(text, /WATCH_DATA_DIR|volume/i, 'the message must say how to fix it');
+
+      // Listing still works so an operator can see the state.
+      const listed = (await broken.client.callTool({
+        name: 'list_weather_watches',
+        arguments: {},
+      })) as CallToolResult;
+      assert.notEqual(listed.isError, true, firstText(listed));
+    } finally {
+      await broken.close();
+    }
+  });
+});
+
+describe('report windows versus available history', () => {
+  it('returns whatever exists when the window is far longer than the history', async () => {
+    // A freshly registered watch has only a few minutes of data, but asking for
+    // 24 h must still succeed and simply aggregate what is there.
+    await call('start_weather_watch', { id: 'partial', location: 'Paris' });
+
+    const result = await call('get_weather_watch_report', { id: 'partial', window_hours: 24 });
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{ aggregate: Record<string, any>; stored_samples: number }>(result);
+    assert.equal(data.aggregate['window_hours'], 24);
+    assert.ok(data.aggregate['sample_count'] >= 1, 'the few available samples must be returned');
+    // A short span is stated plainly. It must NOT be framed as "N of 96", which
+    // is what made a task agent refuse to summarise the data it had.
+    assert.equal(typeof data.aggregate['observed_span_minutes'], 'number');
+    assert.equal('expected_samples' in data.aggregate, false);
+    assert.equal('coverage_percent' in data.aggregate, false);
+    assert.match(firstText(result), /covering .* min of the requested 24 h/);
+  });
+
+  it('distinguishes an empty window from a watch with no history at all', async () => {
+    // Seed history that is inside retention but outside the requested window, so
+    // the two cases cannot be confused.
+    const historicDir = await mkdtemp(join(tmpdir(), 'open-meteo-mcp-historic-'));
+    const store = new WatchStore(historicDir, createLogger('silent'));
+    await store.ensureWritable();
+
+    const tenHoursAgo = new Date(Date.now() - 10 * 3_600_000).toISOString();
+    await store.saveRegistry(
+      [
+        {
+          id: 'historic',
+          label: 'Historic place',
+          latitude: 55.75,
+          longitude: 37.61,
+          country: null,
+          admin1: null,
+          timezone: 'Europe/Moscow',
+          resolved_from: null,
+          units: 'metric',
+          language: 'en',
+          created_at: tenHoursAgo,
+        },
+      ],
+      new Map(),
+    );
+    await store.appendSample(
+      {
+        watch_id: 'historic',
+        at: tenHoursAgo,
+        observed_at: tenHoursAgo,
+        timezone: 'Europe/Moscow',
+        is_day: true,
+        weather_code: 61,
+        condition: 'slight_rain',
+        condition_en: 'Slight rain',
+        condition_ru: 'Небольшой дождь',
+        temperature: 9,
+        apparent_temperature: 7,
+        relative_humidity: 80,
+        precipitation: 0.4,
+        cloud_cover: 90,
+        pressure_msl: 1008,
+        wind_speed: 4,
+        wind_direction: 200,
+        wind_gusts: 8,
+      },
+      168,
+    );
+
+    // A one hour window cannot reach a sample taken ten hours ago.
+    const session = await connectWith(makeConfig(upstream.url, historicDir));
+    try {
+      const result = (await session.client.callTool({
+        name: 'get_weather_watch_report',
+        arguments: { id: 'historic', window_hours: 1 },
+      })) as CallToolResult;
+
+      assert.notEqual(result.isError, true, firstText(result));
+      const text = firstText(result);
+      const data = result.structuredContent as { stored_samples: number; aggregate: Record<string, unknown> };
+
+      assert.equal(data.stored_samples, 1, 'the older sample is still on disk');
+      assert.equal(data.aggregate['sample_count'], 0, 'but it is outside the window');
+      assert.match(text, /window is empty/i);
+      assert.match(text, /does hold 1 older sample/i, 'must not claim there is no data at all');
+      assert.match(text, /window_hours/, 'must tell the caller how to reach it');
+      assert.doesNotMatch(text, /Nothing has been collected/i);
+    } finally {
+      await session.close();
+      await rm(historicDir, { recursive: true, force: true });
+    }
+  });
+
+  it('says nothing has been collected when the watch truly has no history', async () => {
+    const emptyDir = await mkdtemp(join(tmpdir(), 'open-meteo-mcp-empty-'));
+    const store = new WatchStore(emptyDir, createLogger('silent'));
+    await store.ensureWritable();
+    await store.saveRegistry(
+      [
+        {
+          id: 'blank',
+          label: 'Never collected',
+          latitude: 55.75,
+          longitude: 37.61,
+          country: null,
+          admin1: null,
+          timezone: null,
+          resolved_from: null,
+          units: 'metric',
+          language: 'en',
+          created_at: new Date().toISOString(),
+        },
+      ],
+      new Map(),
+    );
+
+    const session = await connectWith(makeConfig(upstream.url, emptyDir));
+    try {
+      const result = (await session.client.callTool({
+        name: 'get_weather_watch_report',
+        arguments: { id: 'blank', window_hours: 24 },
+      })) as CallToolResult;
+
+      assert.notEqual(result.isError, true, firstText(result));
+      const text = firstText(result);
+      assert.match(text, /Nothing has been collected/i);
+      assert.match(text, /15 minutes/, 'should explain how often sampling happens');
+      assert.doesNotMatch(text, /older sample/i);
+    } finally {
+      await session.close();
+      await rm(emptyDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('duplicate location handling', () => {
+  // This block needs its own data directory: the shared server already holds
+  // watches for London and Paris from earlier tests, and deduplication is exactly
+  // what those would interfere with.
+  let dedupClient: Client;
+  let dedupClose: () => Promise<void>;
+  let dedupDir: string;
+
+  const dedupCall = async (name: string, args: Record<string, unknown>): Promise<CallToolResult> =>
+    (await dedupClient.callTool({ name, arguments: args })) as CallToolResult;
+
+  before(async () => {
+    dedupDir = await mkdtemp(join(tmpdir(), 'open-meteo-mcp-dedup-'));
+    const session = await connectWith(makeConfig(upstream.url, dedupDir));
+    dedupClient = session.client;
+    dedupClose = session.close;
+  });
+
+  after(async () => {
+    await dedupClose();
+    await rm(dedupDir, { recursive: true, force: true });
+  });
+
+  it('reuses an existing watch instead of creating a suffixed duplicate', async () => {
+    // This is the exact bug that produced "ekaterinburg-2" and "-3": calling start
+    // twice by place name used to derive a fresh id each time.
+    const first = await dedupCall('start_weather_watch', { location: 'London', countryCode: 'GB' });
+    assert.notEqual(first.isError, true, firstText(first));
+    const firstData = structured<{ watch: Record<string, unknown>; reused_existing_location: boolean }>(first);
+    assert.equal(firstData.reused_existing_location, false, 'the first registration is not a reuse');
+
+    const second = await dedupCall('start_weather_watch', { location: 'London', countryCode: 'GB' });
+    assert.notEqual(second.isError, true, firstText(second));
+    const secondData = structured<{ watch: Record<string, unknown>; reused_existing_location: boolean }>(second);
+
+    assert.equal(secondData.reused_existing_location, true);
+    assert.equal(secondData.watch['id'], firstData.watch['id'], 'the same watch must be reused, not a -2 copy');
+    assert.match(firstText(second), /already tracked/i);
+
+    const listed = await dedupCall('list_weather_watches', {});
+    const london = structured<{ watches: Array<Record<string, unknown>> }>(listed).watches.filter(
+      (entry) => (entry['definition'] as Record<string, unknown>)['resolved_from'] === 'London',
+    );
+    assert.equal(london.length, 1, 'only one watch may exist per point');
+  });
+
+  it('resumes the existing watch when start is called again for a paused location', async () => {
+    const started = await dedupCall('start_weather_watch', { location: 'Paris', countryCode: 'FR' });
+    const id = structured<{ watch: Record<string, unknown> }>(started).watch['id'] as string;
+
+    await dedupCall('stop_weather_watch', { id });
+
+    const restarted = await dedupCall('start_weather_watch', { location: 'Paris', countryCode: 'FR' });
+    assert.notEqual(restarted.isError, true, firstText(restarted));
+    const data = structured<{ watch: Record<string, unknown>; reused_existing_location: boolean }>(restarted);
+
+    assert.equal(data.watch['id'], id, 'resuming must target the same watch');
+    assert.equal(data.reused_existing_location, true);
+    // The wording may be "resuming" (reuse path) or "Resumed" (plain restart).
+    assert.match(firstText(restarted), /resum(ed|ing)/i);
+  });
+
+  it('still creates a separate watch when an explicit id is given for the same point', async () => {
+    // Naming an id is a deliberate request; deduplication must not override it.
+    const auto = await dedupCall('start_weather_watch', { location: 'London', countryCode: 'GB' });
+    const autoId = structured<{ watch: Record<string, unknown> }>(auto).watch['id'] as string;
+
+    const explicit = await dedupCall('start_weather_watch', {
+      id: 'london-second',
+      location: 'London',
+      countryCode: 'GB',
+    });
+    assert.notEqual(explicit.isError, true, firstText(explicit));
+    const data = structured<{ watch: Record<string, unknown>; reused_existing_location: boolean }>(explicit);
+
+    assert.equal(data.watch['id'], 'london-second');
+    assert.equal(data.reused_existing_location, false, 'an explicit id must not be deduplicated away');
+    assert.notEqual(data.watch['id'], autoId);
+  });
+
+  it('keeps the original creation time when reusing a watch', async () => {
+    const first = await dedupCall('start_weather_watch', { location: 'Paris', countryCode: 'FR' });
+    const createdAt = structured<{ watch: Record<string, unknown> }>(first).watch['created_at'];
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const second = await dedupCall('start_weather_watch', { location: 'Paris', countryCode: 'FR' });
+    const after = structured<{ watch: Record<string, unknown> }>(second).watch['created_at'];
+    assert.equal(after, createdAt, 'reuse is not a re-creation');
+  });
+
+  it('registers a distinct watch for a different point with the same name', async () => {
+    // Moscow exists in both RU and US; these are genuinely different places.
+    const ru = await dedupCall('start_weather_watch', { location: 'Moscow', countryCode: 'RU' });
+    const us = await dedupCall('start_weather_watch', { location: 'Moscow', countryCode: 'US' });
+
+    assert.notEqual(ru.isError, true, firstText(ru));
+    assert.notEqual(us.isError, true, firstText(us));
+
+    const ruId = structured<{ watch: Record<string, unknown> }>(ru).watch['id'];
+    const usId = structured<{ watch: Record<string, unknown> }>(us).watch['id'];
+    assert.notEqual(ruId, usId, 'different coordinates must stay separate watches');
+    assert.equal(structured<{ reused_existing_location: boolean }>(us).reused_existing_location, false);
+  });
+});
+
+describe('reports are self-contained about time', () => {
+  it('states when the report was generated, in UTC and in the location timezone', async () => {
+    await call('start_weather_watch', { id: 'timestamped', location: 'Moscow', countryCode: 'RU' });
+
+    const before = Date.now();
+    const result = await call('get_weather_watch_report', { id: 'timestamped', window_hours: 24 });
+    const after = Date.now();
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{ generated_at: string; generated_at_local: string | null }>(result);
+    const generated = Date.parse(data.generated_at);
+
+    // The stamp must be a real instant inside the call window, not a placeholder.
+    assert.ok(Number.isFinite(generated), 'generated_at must be a parsable timestamp');
+    assert.ok(generated >= before - 1000 && generated <= after + 1000, 'generated_at must be the current instant');
+
+    // The mock geocodes Moscow to a known timezone, so a local rendering exists.
+    assert.equal(typeof data.generated_at_local, 'string');
+    assert.match(firstText(result), /generated at:? \d{4}-\d{2}-\d{2}T[\d:.]+Z \(UTC\)/);
+  });
+
+  it('states when a listing was generated', async () => {
+    const result = await call('list_weather_watches', {});
+    assert.notEqual(result.isError, true, firstText(result));
+
+    const data = structured<{ generated_at: string }>(result);
+    assert.ok(Number.isFinite(Date.parse(data.generated_at)));
+    assert.match(firstText(result), /generated at:? \d{4}-\d{2}-\d{2}T[\d:.]+Z \(UTC\)/);
+  });
+
+  it('makes the staleness figure interpretable against a known instant', async () => {
+    const result = await call('get_weather_watch_report', { id: 'timestamped', window_hours: 24 });
+    const data = structured<{
+      generated_at: string;
+      aggregate: { last_sample_at: string | null; staleness_minutes: number | null };
+    }>(result);
+
+    const agg = data.aggregate;
+    assert.ok(agg.last_sample_at !== null && agg.staleness_minutes !== null);
+
+    // staleness_minutes must actually equal generated_at - last_sample_at, which is
+    // only checkable because the report now states its own instant.
+    const expected = (Date.parse(data.generated_at) - Date.parse(agg.last_sample_at!)) / 60_000;
+    assert.ok(
+      Math.abs(expected - agg.staleness_minutes!) <= 1,
+      `staleness (${agg.staleness_minutes}) should match the gap to generated_at (${expected})`,
+    );
   });
 });

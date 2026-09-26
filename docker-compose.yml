@@ -15,11 +15,25 @@ services:
       # port below decides what is actually reachable from outside.
       MCP_HOST: 0.0.0.0
       MCP_PORT: 3000
+      # Where the periodic collector writes watches.json and samples/. Must match
+      # the volume mount below, and must be writable — the root filesystem is
+      # read-only, so without this mount the watch tools disable themselves.
+      WATCH_DATA_DIR: /app/data
 
     # Publish on loopback only. Put nginx/Caddy/Traefik in front for TLS, and
     # change this to "3000:3000" only if the network itself is trusted.
     ports:
       - "127.0.0.1:3000:3000"
+
+    # The collected history lives here, so it survives `docker compose up --build`
+    # and is directly readable on the host:
+    #   cat data/samples/<watch-id>.json | jq .samples[-1]
+    #
+    # The container runs as uid 1000 (`node`), so the host directory must be
+    # writable by that uid:
+    #   mkdir -p data && sudo chown 1000:1000 data
+    volumes:
+      - ./data:/app/data
 
     # If a token is set but you still want a hard guard against accidentally
     # exposing the service, keep this assertion enabled: the container refuses
@@ -35,8 +49,8 @@ services:
       retries: 3
       start_period: 5s
 
-    # The server is stateless and holds no data; read-only root plus a tmpfs is
-    # enough, and drops the ability to write anywhere in the image.
+    # Everything except the data volume stays read-only: the image itself is never
+    # written to, and /tmp is a private tmpfs for the runtime's scratch use.
     read_only: true
     tmpfs:
       - /tmp

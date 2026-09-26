@@ -4,13 +4,25 @@ import { registerAirQualityTool } from './air-quality.js';
 import { registerCurrentWeatherTool } from './current-weather.js';
 import { registerForecastTool } from './forecast.js';
 import { registerGeocodeTool } from './geocode.js';
+import { registerWeatherWatchTools } from './weather-watch.js';
 
 /** Names in the order they are registered; also used by the smoke test. */
-export const TOOL_NAMES = ['geocode_location', 'get_current_weather', 'get_weather_forecast', 'get_air_quality'] as const;
+export const TOOL_NAMES = [
+  'geocode_location',
+  'get_current_weather',
+  'get_weather_forecast',
+  'get_air_quality',
+  'start_weather_watch',
+  'stop_weather_watch',
+  'delete_weather_watch',
+  'list_weather_watches',
+  'get_weather_watch_report',
+] as const;
 
 export function registerAllTools(server: McpServer, deps: ToolDeps): void {
   registerGeocodeTool(server, deps);
   registerCurrentWeatherTool(server, deps);
   registerForecastTool(server, deps);
   registerAirQualityTool(server, deps);
+  registerWeatherWatchTools(server, deps);
 }

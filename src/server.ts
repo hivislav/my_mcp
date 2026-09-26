@@ -4,6 +4,7 @@ import type { Logger } from './logger.js';
 import { createClients } from './open-meteo/client.js';
 import { registerAllTools } from './tools/index.js';
 import type { ToolDeps } from './tools/deps.js';
+import { WatchService } from './watch/service.js';
 import { SERVER_NAME, SERVER_VERSION } from './version.js';
 
 /**
@@ -39,10 +40,15 @@ Constraints worth knowing:
   it is not a station observation, so it can differ slightly from a local thermometer.`;
 
 export function buildDeps(config: Config, logger: Logger): ToolDeps {
+  const clients = createClients(config, logger);
   return {
-    clients: createClients(config, logger),
+    clients,
     logger,
     config,
+    // One collector per process. It must NOT be created inside createServer():
+    // stateless MCP builds a fresh server for every HTTP request, so the timer
+    // would be recreated per call and could never fire on a schedule.
+    watches: new WatchService({ config, source: { clients, config }, logger }),
   };
 }
 

@@ -65,6 +65,9 @@ export async function startHttpServer(config: Config, deps: ToolDeps, logger: Lo
     }
 
     if (path === '/healthz' || path === '/health') {
+      // The collector's state belongs in the health payload: a stalled watcher is
+      // invisible otherwise, and the data it produces would silently go stale.
+      const watches = deps.watches.list();
       sendJson(res, 200, {
         status: 'ok',
         name: SERVER_NAME,
@@ -72,6 +75,14 @@ export async function startHttpServer(config: Config, deps: ToolDeps, logger: Lo
         transport: 'http',
         sessionMode: config.http.sessionMode,
         uptimeSeconds: Math.round(process.uptime()),
+        watcher: {
+          enabled: config.watch.enabled,
+          available: deps.watches.unavailableReason === null && config.watch.enabled,
+          unavailableReason: deps.watches.unavailableReason,
+          intervalSeconds: deps.watches.intervalSeconds,
+          watchCount: watches.length,
+          failingWatches: watches.filter((entry) => !entry.healthy).map((entry) => entry.definition.id),
+        },
       });
       return;
     }

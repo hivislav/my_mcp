@@ -60,6 +60,20 @@ export interface Config {
     /** Sent as User-Agent so the upstream operator can identify the caller. */
     userAgent: string;
   };
+  watch: {
+    /** When false the collector never starts and the watch tools report why. */
+    enabled: boolean;
+    /** Seconds between collection cycles. */
+    intervalSeconds: number;
+    /** Samples older than this are pruned on every write. */
+    retentionHours: number;
+    /**
+     * Directory holding watches.json and samples/. MUST be a writable mount when
+     * the container runs with a read-only root filesystem.
+     */
+    dataDir: string;
+    maxWatches: number;
+  };
   logLevel: LogLevel;
 }
 
@@ -178,6 +192,15 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
       timeoutMs: envInt('OPEN_METEO_TIMEOUT_MS', 15_000, 1000, 120_000),
       maxRetries: envInt('OPEN_METEO_MAX_RETRIES', 2, 0, 5),
       userAgent: envStr('OPEN_METEO_USER_AGENT') ?? 'open-meteo-mcp/1.0.0 (+https://github.com/)',
+    },
+    watch: {
+      enabled: envBool('WATCH_ENABLED', true),
+      // 15 minutes: frequent enough to see a trend within a day, far below the
+      // free tier's minutely request limit even with several watches.
+      intervalSeconds: envInt('WATCH_INTERVAL_SECONDS', 900, 30, 86_400),
+      retentionHours: envInt('WATCH_RETENTION_HOURS', 168, 1, 8760),
+      dataDir: envStr('WATCH_DATA_DIR') ?? './data',
+      maxWatches: envInt('WATCH_MAX_WATCHES', 20, 1, 500),
     },
     logLevel: logLevelRaw as LogLevel,
   };

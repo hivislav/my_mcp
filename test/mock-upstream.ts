@@ -50,6 +50,18 @@ const PLACES = [
     population: 25060,
   },
   {
+    id: 2643743,
+    name: 'London',
+    latitude: 51.50853,
+    longitude: -0.12574,
+    elevation: 25,
+    country_code: 'GB',
+    country: 'United Kingdom',
+    admin1: 'England',
+    timezone: 'Europe/London',
+    population: 7556900,
+  },
+  {
     id: 2988507,
     name: 'Paris',
     latitude: 48.85341,

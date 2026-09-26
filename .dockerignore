@@ -8,6 +8,7 @@ node_modules
 .npm-cache
 dist
 coverage
+data
 
 # Never ship secrets or VCS history into an image layer.
 .env

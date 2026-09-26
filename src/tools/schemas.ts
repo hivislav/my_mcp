@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { ResolvedLocation } from './shared.js';
-import { UNIT_SYSTEM_DESCRIPTION } from './result.js';
+import { UNIT_SYSTEM_DESCRIPTION } from '../weather/units.js';
 
 /**
  * The location inputs are shared by every weather tool so that the parameter

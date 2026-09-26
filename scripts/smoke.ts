@@ -26,6 +26,9 @@ const CHECKS: Check[] = [
   { tool: 'get_current_weather', args: { location: 'Moscow' } },
   { tool: 'get_weather_forecast', args: { location: 'Moscow', days: 3 } },
   { tool: 'get_air_quality', args: { location: 'Moscow' } },
+  // Read-only, so the smoke test never registers or deletes a watch: it only
+  // confirms the collector is reachable and reports its interval.
+  { tool: 'list_weather_watches', args: {} },
 ];
 
 function argValue(flag: string): string | undefined {

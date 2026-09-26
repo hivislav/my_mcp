@@ -1,8 +1,10 @@
 /**
- * Open-Meteo returns loosely typed JSON: numeric fields can be `null`, and the
- * `current` block is typed as `number | string | null` because it mixes values
- * with the ISO timestamp. These helpers normalise that into `number | null` and
- * `string | null` so the tool output schema can be declared precisely.
+ * Normalisation of the loosely typed JSON that Open-Meteo returns.
+ *
+ * Numeric fields can be `null`, and the `current` block is typed as
+ * `number | string | null` because it mixes values with the ISO timestamp.
+ * These helpers turn that into precise `number | null` / `string | null` so
+ * output schemas can be declared exactly.
  */
 
 export function num(value: unknown): number | null {
@@ -29,4 +31,11 @@ export function bool(value: unknown): boolean | null {
 export function series(block: Record<string, Array<number | string | null>> | undefined, key: string) {
   const value = block?.[key];
   return Array.isArray(value) ? value : [];
+}
+
+/** Rounds to `digits` decimals, passing `null`/non-finite values through as `null`. */
+export function round(value: number | null | undefined, digits = 1): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
 }

@@ -1,6 +1,6 @@
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { Logger } from '../logger.js';
-import { InvalidInputError, OpenMeteoError } from '../open-meteo/errors.js';
+import { AppError, InvalidInputError, OpenMeteoError } from '../errors.js';
 
 /**
  * Every tool returns BOTH `content` and `structuredContent`.
@@ -62,6 +62,13 @@ export async function guard<Args>(
       });
       return toolError(error.toToolMessage());
     }
+    // Other AppErrors (watch unavailable, watch limit) already carry a message
+    // written for the model, so forward it unchanged instead of hiding a
+    // fixable condition behind "internal error".
+    if (error instanceof AppError) {
+      logger.warn('tool reported a recoverable error', { tool: toolName, message: error.message });
+      return toolError(error.message);
+    }
     logger.error('unhandled tool error', {
       tool: toolName,
       message: error instanceof Error ? error.message : String(error),
@@ -80,27 +87,3 @@ export function formatLines(entries: Array<[string, string | number | null | und
     .map(([label, value]) => `${label}: ${String(value)}`)
     .join('\n');
 }
-
-/** Shared unit metadata so a structured payload always explains its own numbers. */
-export interface UnitSet {
-  temperature: string;
-  wind_speed: string;
-  precipitation: string;
-}
-
-export type UnitSystem = 'metric' | 'imperial';
-
-export function unitsFor(system: UnitSystem): UnitSet {
-  return system === 'imperial'
-    ? { temperature: '°F', wind_speed: 'mph', precipitation: 'inch' }
-    : { temperature: '°C', wind_speed: 'km/h', precipitation: 'mm' };
-}
-
-export function upstreamParamsFor(system: UnitSystem) {
-  return system === 'imperial'
-    ? { temperature_unit: 'fahrenheit', wind_speed_unit: 'mph', precipitation_unit: 'inch' }
-    : { temperature_unit: 'celsius', wind_speed_unit: 'kmh', precipitation_unit: 'mm' };
-}
-
-export const UNIT_SYSTEM_DESCRIPTION =
-  'Unit system for all returned values: "metric" (°C, km/h, mm) or "imperial" (°F, mph, inch). Defaults to metric.';
